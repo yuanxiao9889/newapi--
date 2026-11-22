@@ -1,0 +1,23 @@
+node_modules/
+dist/
+desktop-ui/
+release/
+
+# Local development tools and settings
+.codex/
+.env
+.env.*
+!.env.example
+.npmrc
+*.log
+
+# Local account data, credentials and portable configurations
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.qdconfig
+*.pem
+*.key
+*.pfx
+*.p12

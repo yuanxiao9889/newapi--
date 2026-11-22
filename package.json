@@ -1,0 +1,65 @@
+{
+  "name": "quotadesk",
+  "private": true,
+  "version": "1.0.4",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "start": "node scripts/dev.mjs",
+    "package:win": "npm run build && electron-builder --win nsis --x64 --publish never",
+    "test": "node --test tests/monitor.test.mjs tests/config-transfer.test.mjs",
+    "prepackage:win": "node -e \"require('electron')\""
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.9.0",
+    "lucide-react": "^0.577.0",
+    "nodemailer": "10.6.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "electron": "45.4.1",
+    "electron-builder": "26.18.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "~5.9.3",
+    "vite": "^8.3.8"
+  },
+  "productName": "QuotaDesk",
+  "description": "Multi-site New API wallet and usage monitor",
+  "author": "QuotaDesk",
+  "main": "desktop/main.mjs",
+  "build": {
+    "appId": "cn.quotadesk.monitor",
+    "productName": "QuotaDesk",
+    "directories": {
+      "output": "release"
+    },
+    "electronDist": "node_modules/electron/dist",
+    "files": [
+      "desktop-ui/**/*",
+      "desktop/**/*",
+      "package.json",
+      "!node_modules/@base-ui/**",
+      "!node_modules/react/**",
+      "!node_modules/react-dom/**",
+      "!node_modules/lucide-react/**"
+    ],
+    "win": {
+      "icon": "desktop/assets/icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "artifactName": "QuotaDesk-Setup-${version}-${arch}.${ext}"
+    }
+  }
+}

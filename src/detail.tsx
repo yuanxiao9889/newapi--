@@ -11,7 +11,7 @@ import {
   Settings2,
   Wallet,
 } from 'lucide-react'
-import { balanceLabels, balanceText, fullTime, money, deliveryLabel, series, unitName, unitSymbol, walletKeyHint, type Notice, type Site, type UsageRow } from './model'
+import { balanceLabels, balanceText, customBalanceLabel, estimateLabel, fullTime, money, deliveryLabel, periodAvailable, series, unitName, unitSymbol, walletKeyHint, type Notice, type Site, type UsageRow } from './model'
 import { SiteMark, Status, Surface, Trend } from './visuals'
 
 function KeyCosts({ site }: { site: Site }) {
@@ -71,6 +71,7 @@ export function Detail({
   const [fallback, setFallback] = useState(String(site.fallbackRate ?? ''))
   const [group, setGroup] = useState<string | null>(null)
   const isSub = site.provider === 'sub2api'
+  const isCustom = site.provider === 'custom'
   const autoUsd = conversionDraft ?? !!site.autoUsd
   const unitChoices = [...new Set(['CNY', 'USD', site.sourceUnit ?? site.unit, site.unit])]
   const [busy, setBusy] = useState(false),
@@ -113,7 +114,7 @@ export function Detail({
         <div className="detail-balance">
           <div className="stat-label">
             <Wallet size={16} />
-            账户钱包余额
+            {isCustom ? customBalanceLabel(site.balanceScope) : '账户钱包余额'}
           </div>
           <strong>{site.accountBalance == null ? '暂不可查' : money(site.accountBalance, site.unit)}</strong>
           {site.walletChecked != null
@@ -178,14 +179,14 @@ export function Detail({
             {site.autoUsd && <small>1 美元 = {site.usdRate ?? site.fallbackRate} 元</small>}
             {site.billing && <small>1 {unitSymbol(site.unit)} = {site.billing.rmbRate} 元</small>}
           </div>
-          {!isSub && !site.autoUsd && conversionDraft === null && <button className="btn secondary" aria-expanded={billingOpen} onClick={() => {
+          {!isSub && !isCustom && !site.autoUsd && conversionDraft === null && <button className="btn secondary" aria-expanded={billingOpen} onClick={() => {
             setBillingUnit(site.unit)
             setRate(String(site.billing?.rmbRate ?? ''))
             setErr('')
             setBillingOpen(!billingOpen)
           }}>设置单位</button>}
         </div>
-        <form className="billing-editor" onSubmit={(e) => {
+        {!isCustom && <form className="billing-editor" onSubmit={(e) => {
           e.preventDefault()
           void action(async () => {
             await api.setAutoUsd({ id: site.id, enabled: autoUsd,
@@ -214,7 +215,7 @@ export function Detail({
               保存换算设置
             </button>
           </>}
-        </form>
+        </form>}
         {billingOpen && (
           <form className="billing-editor" onSubmit={(e) => {
             e.preventDefault()
@@ -261,6 +262,8 @@ export function Detail({
             </div>
           </div>
           <Trend data={series([site], span)} unit={site.unit} />
+          {periodAvailable(site, 'today') ? <p className="note">今日消费 {money(site.todayValue!, site.unit)} · {estimateLabel(site) || '平台统计'}</p>
+            : isCustom && <p className="note">等待可比较的余额记录后估算今日消费。</p>}
           {site.usageNote && <p className="note">{site.usageNote}</p>}
         </section>
         {isSub && <KeyCosts site={site} />}
@@ -277,7 +280,7 @@ export function Detail({
           </button>
           <button className="btn secondary" onClick={replace}>
             <KeyRound size={14} />
-            更换令牌
+            {isCustom ? '编辑余额接口' : '更换令牌'}
           </button>
           <button
             className="btn secondary"
@@ -344,6 +347,7 @@ export function Detail({
                   {n.closed ? '已恢复' : '低余额'} · {money(n.balance, n.unit)}
                 </span>
                 <time>{fullTime(n.at)}</time>
+                {n.flashduty && <small title={n.flashduty.error}>Flashduty · {deliveryLabel[n.flashduty.status]}</small>}
                 {n.delivery !== 'off' && (
                   <button className="log-link" onClick={() => preview(n)}>
                     {deliveryLabel[n.delivery]}

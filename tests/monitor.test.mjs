@@ -10,6 +10,92 @@ import { querySite, requestJson, siteAddress } from '../desktop/new-api.mjs'
 import { deliver, emptyMail, mailConfig } from '../desktop/mail.mjs'
 import { querySub2Api } from '../desktop/sub2api.mjs'
 
+test('balance-only polling carries the last daily reading through a restart, recharge and month boundary', async (t) => {
+  const folder = await mkdtemp(join(tmpdir(), 'quotadesk-spend-'))
+  const database = join(folder, 'wallet.sqlite')
+  const crypto = { encryptStringAsync: async (v) => Buffer.from(v), decryptStringAsync: async (v) => ({ result: v.toString() }) }
+  let monitor = new Monitor(database, crypto)
+  t.after(async () => { monitor.db.close(); await rm(folder, { recursive: true, force: true }) })
+  const at = (day, hour) => new Date(2026, 0, day, hour).getTime()
+  let now = at(31, 17), balance = 100
+  t.mock.method(Date, 'now', () => now)
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ balance }))
+  const input = { provider: 'custom', origin: 'https://fixture.test/balance', token: 'a',
+    custom: { balancePath: 'balance', auth: 'bearer', currency: 'USD' } }
+  const { ticket } = await monitor.probe(input)
+  const id = monitor.saveSite({ ticket, threshold: 0, fallbackRate: 7 })
+  const site = () => monitor.state.sites[0]
+  const read = async (day, hour, value) => {
+    now = at(day, hour)
+    balance = value
+    await monitor.poll(id)
+    return site().todayValue
+  }
+  assert.equal(site().todayValue, null)
+  assert.equal(await read(31, 23, 90), 10)
+  assert.equal(site().estimatedSince, at(31, 17))
+  monitor.db.close()
+  monitor = new Monitor(database, crypto)
+  assert.equal(await read(32, 1, 83), 7)
+  assert.equal(await read(32, 2, 133), 7)
+  assert.equal(await read(32, 3, 128), 12)
+  assert.equal(await read(32, 3, 128), 12)
+  assert.equal(displayState(monitor.state).sites[0].todayValue, 84)
+  assert.deepEqual(site().history, [{ day: '2026-01-31', value: 10 }, { day: '2026-02-01', value: 12 }])
+  assert.equal(await read(34, 10, 60), null)
+  assert.equal(await read(34, 12, 56), 4)
+  assert.equal(site().estimatedSince, at(34, 10))
+  const replacement = await monitor.probe({ ...input, id, token: 'b' })
+  monitor.saveSite({ id, ticket: replacement.ticket, threshold: 0, fallbackRate: 7 })
+  assert.deepEqual([site().todayValue, site().history], [null, []])
+})
+
+test('New API prefers direct daily spend including zero, then cumulative quota across recharges', async (t) => {
+  const mon = new Monitor(':memory:', { encryptStringAsync: async (v) => Buffer.from(v), decryptStringAsync: async (v) => ({ result: v.toString() }) })
+  t.after(() => mon.db.close())
+  let quota = 500, used = 10, direct = 5
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const { pathname } = new URL(input)
+    if (pathname === '/api/status') return Response.json({ success: true, data: { quota_display_type: 'USD', quota_per_unit: 2, enable_data_export: false } })
+    if (pathname === '/api/user/self') return Response.json({ success: true, data: { id: 1, quota, used_quota: used } })
+    return direct == null ? new Response(null, { status: 403 }) : Response.json({ success: true, data: { quota: direct } })
+  })
+  const { ticket } = await mon.probe({ origin: 'https://fixture.test', token: 'a' })
+  const id = mon.saveSite({ ticket, threshold: 0 })
+  direct = null
+  used += 8
+  quota += 90
+  await mon.poll(id)
+  assert.equal(mon.state.sites[0].todayValue, 6.5)
+  direct = 0
+  await mon.poll(id)
+  assert.deepEqual([mon.state.sites[0].todayValue, mon.state.sites[0].estimatedSince], [0, null])
+})
+
+test('SUB2API uses a shared wallet estimate once and replaces it with Key spend when available', async (t) => {
+  const mon = new Monitor(':memory:', { encryptStringAsync: async (v) => Buffer.from(v), decryptStringAsync: async (v) => ({ result: v.toString() }) })
+  t.after(() => mon.db.close())
+  let balance = 100, usage = {}
+  t.mock.method(globalThis, 'fetch', async (_url, options) => Response.json({ mode: 'unrestricted', balance, daily_usage: [],
+    usage: options.headers.Authorization === 'Bearer b' ? usage : {} }))
+  const ids = []
+  for (const token of ['a', 'b']) {
+    const { ticket } = await mon.probe({ provider: 'sub2api', origin: 'https://fixture.test', token })
+    ids.push(mon.saveSite({ ticket, threshold: 0 }))
+  }
+  balance = 90
+  for (const id of ids) await mon.poll(id)
+  const amounts = () => displayState(mon.state).sites.map((s) => s.todayValue).filter(Number.isFinite)
+  assert.deepEqual(amounts(), [10])
+  assert.equal(displayState(mon.state).sites.filter((s) => s.walletSpendEstimate).length, 1)
+  usage = { today: { actual_cost: 0 }, total: { actual_cost: 10 } }
+  await mon.poll(ids[1])
+  assert.deepEqual(amounts(), [0])
+  usage = { total: { actual_cost: 13 } }
+  await mon.poll(ids[1])
+  assert.deepEqual(amounts(), [3])
+})
+
 test('a transient wallet failure retries once, respects cooldowns across restart and clears on recovery', async (t) => {
   const folder = await mkdtemp(join(tmpdir(), 'quotadesk-retry-'))
   const database = join(folder, 'wallet.sqlite')
@@ -83,6 +169,24 @@ test('New API reports the 429 cooldown even when its parallel configuration chec
   })
 })
 
+test('403 access pages and browser challenges are distinguished from API permission failures', async (t) => {
+  let headers
+  t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 403, headers }))
+  for (const [responseHeaders, message, authFailure] of [
+    [{ 'content-type': 'text/html; charset=UTF-8', server: 'cloudflare' }, /访问限制网页/, false],
+    [{ 'cf-mitigated': 'challenge' }, /Cloudflare 要求浏览器验证/, false],
+    [{ 'content-type': 'application/json', server: 'cloudflare' }, /权限不足/, true],
+  ]) {
+    headers = responseHeaders
+    await assert.rejects(requestJson('https://sample.test', {}, '余额查询'), (err) => {
+      assert.equal(err.status, 403)
+      assert.equal(err.authFailure, authFailure)
+      assert.match(err.message, message)
+      return true
+    })
+  }
+})
+
 test('transport errors expose safe causes while certificate problems require attention immediately', async (t) => {
   let code
   t.mock.method(globalThis, 'fetch', async () => {
@@ -99,6 +203,19 @@ test('transport errors expose safe causes while certificate problems require att
       assert.ok(!err.message.includes('sensitive'))
       return true
     })
+  }
+})
+
+test('Chromium proxy failures and cancelled redirects retain actionable descriptions', async (t) => {
+  let message
+  t.mock.method(globalThis, 'fetch', async () => { throw Error(message) })
+  for (const [reason, expected] of [
+    ['net::ERR_PROXY_CONNECTION_FAILED', /系统代理连接失败/],
+    ['net::ERR_CERT_AUTHORITY_INVALID', /证书验证失败/],
+    ['Redirect was cancelled', /请填写最终的站点网址/],
+  ]) {
+    message = reason
+    await assert.rejects(requestJson('https://sample.test', {}, '余额查询'), expected)
   }
 })
 
@@ -439,7 +556,8 @@ test('wallet reads, optional usage, persistent alert cycles and token replacemen
   quota = 800000
   await mon.poll(id)
   assert.equal(mon.state.sites[0].usage, false)
-  assert.equal(mon.state.sites[0].todayValue, null)
+  assert.equal(mon.state.sites[0].todayValue, 0.7)
+  assert.ok(mon.state.sites[0].estimatedSince)
   assert.ok(mon.state.notices[0].closed)
   quota = 150000
   await mon.poll(id)
@@ -662,4 +780,117 @@ test('startup isolates interrupted recipients and preserves the original single-
   assert.equal(legacy.recipients[0].id, legacy.id)
   assert.equal(legacy.delivery, 'uncertain')
   assert.deepEqual(group.recipients.map((r) => r.delivery), ['sent', 'uncertain', 'sent'])
+})
+
+test('Flashduty escalates an emailed notice only on a later scheduled low reading and retries the same event', async (t) => {
+  const crypto = { encryptStringAsync: async (v) => Buffer.from(v), decryptStringAsync: async (v) => ({ result: v.toString() }) }
+  const dir = await mkdtemp(join(tmpdir(), 'quotadesk-flashduty-'))
+  const db = join(dir, 'state.sqlite')
+  let failMail = true, failQuery = false, now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  let mailCount = 0
+  const sendMail = async () => {
+    mailCount++
+    if (failMail) throw Error('mail rejected')
+  }
+  let mon = new Monitor(db, crypto, undefined, sendMail)
+  t.after(async () => { mon.db.close(); await rm(dir, { recursive: true, force: true }) })
+  const address = 'https://api.flashcat.cloud/event/push/alert/standard?integration_key=fixture-key'
+  let balance = 100, fail = false
+  const events = []
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (url.toString() !== address) return failQuery ? new Response('', { status: 503 }) : Response.json({ balance })
+    assert.equal(options.method, 'POST')
+    assert.equal(options.redirect, 'error')
+    events.push(JSON.parse(options.body))
+    return Response.json({ err: fail ? 'invalid' : '' })
+  })
+  const idle = async () => {
+    for (let i = 0; i < 100 && (mon.sendingFlashduty || mon.sending); i++) await new Promise((resolve) => setTimeout(resolve, 1))
+    assert.equal(mon.sendingFlashduty, false)
+    assert.equal(mon.sending, false)
+  }
+  const cycle = async () => {
+    now += mon.state.minutes * 60000
+    await mon.sweep()
+    await idle()
+  }
+  const { ticket } = await mon.probe({ provider: 'custom', origin: 'https://fixture.test/balance', token: 'private-site-token',
+    custom: { balancePath: 'balance', auth: 'bearer', currency: 'CNY' } })
+  const id = mon.saveSite({ ticket, name: '测试站点', threshold: 30 })
+  await assert.rejects(mon.configureFlashduty({ enabled: true, address: 'https://other.example/?integration_key=secret' }), /集成地址/)
+  await mon.configureFlashduty({ enabled: false, address }, true)
+  assert.equal(mon.state.flashduty.configured, false)
+  await mon.configureFlashduty({ enabled: true, address })
+  assert.equal(JSON.stringify(mon.state).includes('fixture-key'), false)
+  assert.equal(events.length, 1)
+  assert.equal(events[0].labels.kind, 'test')
+  fail = true
+  balance = 15
+  await mon.poll(id); await idle()
+  const notice = () => mon.state.notices[0]
+  assert.equal(notice().delivery, 'off')
+  await cycle()
+  assert.equal(events.length, 1)
+  // A pending event from the previous parallel-delivery rule must not escape on restart.
+  mon.change((s) => { s.notices[0].flashduty = { status: 'pending', attempts: 0 } })
+  mon.db.close()
+  mon = new Monitor(db, crypto, undefined, sendMail)
+  await cycle()
+  assert.equal(events.length, 1)
+  await mon.configure({ config: { ...emptyMail, enabled: true, host: 'localhost', from: 'me@example.test', to: 'me@example.test' } })
+  await idle()
+  assert.equal(notice().delivery, 'failed')
+  await cycle()
+  assert.equal(events.length, 1)
+  failMail = false
+  await cycle()
+  assert.equal(notice().delivery, 'sent')
+  assert.equal(events.length, 1)
+  await mon.refreshSite(id); await idle()
+  mon.preferences({ globalThreshold: 31 })
+  await mon.configureFlashduty({ enabled: true })
+  await idle()
+  assert.equal(events.length, 1)
+  failQuery = true
+  await cycle()
+  assert.equal(events.length, 1)
+  failQuery = false
+  balance = 12
+  await cycle()
+  assert.equal(notice().flashduty.status, 'failed')
+  assert.equal(events[1].event_status, 'Warning')
+  assert.match(events[1].title_rule, /测试站点.*12.*31/)
+  assert.ok(!JSON.stringify(events).includes('private-site-token'))
+  mon.db.close()
+  mon = new Monitor(db, crypto, undefined, sendMail)
+  fail = false
+  mon.retryFlashduty(notice().id); await idle()
+  assert.equal(notice().flashduty.status, 'sent')
+  assert.equal(events[1].alert_key, events[2].alert_key)
+  await cycle()
+  assert.equal(events.length, 3)
+  balance = 60
+  await mon.poll(id)
+  balance = 10
+  await mon.poll(id); await idle()
+  assert.equal(events.length, 3)
+  balance = 31
+  await cycle()
+  assert.ok(notice().closed)
+  assert.equal(events.length, 3)
+  balance = 9
+  const beforeMail = mailCount
+  await cycle()
+  assert.equal(mailCount, beforeMail + 1)
+  assert.equal(events.length, 3)
+  await cycle()
+  assert.equal(events.length, 4)
+  assert.notEqual(events[3].alert_key, events[2].alert_key)
+  await mon.configureFlashduty({ enabled: false })
+  balance = 55
+  await mon.poll(id)
+  balance = 9
+  await mon.poll(id)
+  assert.equal(events.length, 4)
 })

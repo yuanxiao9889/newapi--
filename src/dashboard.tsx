@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import type { Site, Unit, Wallet as WalletAmount } from './model'
 import {
+  estimateLabel,
   fullTime,
   money,
   periodAvailable,
@@ -57,8 +58,9 @@ export function Overview({
     monthly = unitSites.filter((s) => periodAvailable(s, 'month'))
   const today = current.reduce((a, s) => a + sumPeriod(s, 'today'), 0)
   const month = monthly.reduce((a, s) => a + sumPeriod(s, 'month'), 0)
-  const two = series(current, 2),
-    past = two[0].value
+  const estimated = current.filter((s) => s.estimatedSince != null).length
+  const [yesterday] = series(current, 2)
+  const past = current.every((s) => s.history.some((p) => p.day === yesterday.day)) ? yesterday.value : null
   const delta = past ? ((today - past) / past) * 100 : null
   const warn = sites.filter(hasBalanceAlert).length
   const sorted = [...monthly]
@@ -112,7 +114,8 @@ export function Overview({
                 {Math.abs(delta).toFixed(1)}%
               </span>
             )}
-            {delta !== null ? '较昨日' : current.length + ' 个站点提供统计'}
+            {delta !== null && '较昨日 · '}
+            {current.length} / {unitSites.length} 个站点{estimated > 0 && ` · ${estimated} 个估算`}
           </div>
         </section>
         <section className="stat">
@@ -330,8 +333,10 @@ export function SiteTable({
             </tr>
           </thead>
           <tbody>
-            {rows.map((s) => (
-              <tr key={s.id} className={hasBalanceAlert(s) ? 'site-alert-row' : undefined} onClick={() => open(s)}>
+            {rows.map((s) => {
+              const address = new URL(s.origin)
+              const siteUrl = s.provider === 'custom' ? address.origin : s.origin
+              return <tr key={s.id} className={hasBalanceAlert(s) ? 'site-alert-row' : undefined} onClick={() => open(s)}>
                 <td>
                   <div className="site-identity">
                     <SiteMark site={s} />
@@ -340,14 +345,14 @@ export function SiteTable({
                         e.stopPropagation()
                         open(s)
                       }}>{s.name}</button>
-                      <a className="site-url" href={s.origin} title={'用默认浏览器打开 ' + s.origin}
-                        aria-label={'用默认浏览器打开 ' + s.name + '（' + s.origin + '）'}
+                      <a className="site-url" href={siteUrl} title={'用默认浏览器打开 ' + siteUrl}
+                        aria-label={'用默认浏览器打开 ' + s.name + '（' + siteUrl + '）'}
                         onClick={(e) => {
                           e.preventDefault()
                           e.stopPropagation()
                           visit(s)
                         }}>
-                        {new URL(s.origin).host} <ExternalLink size={11} aria-hidden="true" />
+                        {address.host} <ExternalLink size={11} aria-hidden="true" />
                       </a>
                     </div>
                   </div>
@@ -359,7 +364,9 @@ export function SiteTable({
                 {(['today', 'month'] as const).map((k) => (
                   <td key={k} className="num">
                     {periodAvailable(s, k) ? (
-                      money(sumPeriod(s, k), s.unit)
+                      <>{money(sumPeriod(s, k), s.unit)}
+                        {k === 'today' && s.estimatedSince != null && <small className="balance-kind">{estimateLabel(s)}</small>}
+                      </>
                     ) : (
                       <span className="muted" title="暂无统计">
                         —
@@ -378,7 +385,7 @@ export function SiteTable({
                   <ChevronRight size={15} />
                 </td>
               </tr>
-            ))}
+            })}
           </tbody>
         </table>
       </div>

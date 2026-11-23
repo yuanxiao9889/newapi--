@@ -62,7 +62,7 @@ export async function querySub2Api({ origin, token }, now = new Date()) {
     .map((r) => ({ label: r.model, ...usageRow(r) })) : []
   const total = data.usage?.total ? usageRow(data.usage.total) : null
   const todayRow = daily?.find((r) => r.label === today)
-  const todayValue = daily === null ? number(data.usage?.today?.actual_cost) : todayRow ? todayRow.actual : 0
+  const todayValue = todayRow?.actual ?? number(data.usage?.today?.actual_cost)
   const thisMonth = daily?.filter((r) => r.label >= monthStart && r.label <= today)
   // Model stats use the requested calendar-month range even on versions without daily rows.
   const monthRows = thisMonth ?? (models.length ? models : null)
@@ -73,6 +73,7 @@ export async function querySub2Api({ origin, token }, now = new Date()) {
   const usage = todayValue !== null || monthValue !== null || total !== null || models.length > 0
   return {
     balanceKind, balance, accountId: null, unit: 'USD', usdPerUnit: 1, usdRate: null,
+    quotaUsed: balanceKind === 'quota' ? number(data.quota.used) : null,
     todayValue, monthValue, periodDay: today, history, usage,
     usageNote: daily === null ? '站点未返回每日明细。' : '',
     keyUsage: { total, daily, models, month: today.slice(0, 7), limits: limits(data),

@@ -1,3 +1,5 @@
+import { fetchHttp } from './http.mjs'
+
 export function siteAddress(value, provider = 'new-api') {
   let url
   try {
@@ -15,6 +17,7 @@ export function siteAddress(value, provider = 'new-api') {
     url.search
   )
     throw new Error('站点地址应为 HTTP(S) 网址，可包含部署子路径。')
+  if (provider === 'custom') return url.href
   const endpoint = provider === 'sub2api' ? /\/(?:key-usage|v1(?:\/usage)?)$/ : /\/(?:api|v1)$/
   return url.origin + url.pathname.replace(/\/+$/, '').replace(endpoint, '')
 }
@@ -25,9 +28,10 @@ const httpLabels = {
 }
 
 export class ApiError extends Error {
-  constructor(message, status = 0, { label, transient, retryAt = 0, range = false } = {}) {
+  constructor(message, status = 0, { label, transient, retryAt = 0, range = false, authFailure = [401, 403].includes(status) } = {}) {
     super(message)
     this.status = status
+    this.authFailure = authFailure
     this.label = label ?? (status ? (httpLabels[status] || 'HTTP 错误') + ' ' + status : undefined)
     this.transient = transient ?? ([408, 425, 429].includes(status) || (status >= 500 && status < 600))
     this.retryAt = retryAt
@@ -42,13 +46,14 @@ function retryAfter(value) {
 }
 
 function transportError(subject, error, timedOut) {
-  const code = error.cause?.code ?? error.cause?.errors?.[0]?.code ?? error.code
+  const code = error.cause?.code ?? error.cause?.errors?.[0]?.code ?? error.code ?? error.message?.match(/net::(ERR_[A-Z_]+)/)?.[1]
   let label = '网络连接中断', transient = true
-  if (timedOut || error.name === 'TimeoutError' || ['ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'].includes(code))
+  if (timedOut || error.name === 'TimeoutError' || ['ETIMEDOUT', 'ERR_TIMED_OUT', 'ERR_CONNECTION_TIMED_OUT', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'].includes(code))
     label = '请求超时'
-  else if (['ENOTFOUND', 'EAI_AGAIN'].includes(code)) label = 'DNS 解析失败'
-  else if (code === 'ECONNREFUSED') label = '连接被拒绝'
-  else if (['ENETUNREACH', 'EHOSTUNREACH'].includes(code)) label = '网络不可达'
+  else if (['ENOTFOUND', 'EAI_AGAIN', 'ERR_NAME_NOT_RESOLVED'].includes(code)) label = 'DNS 解析失败'
+  else if (['ECONNREFUSED', 'ERR_CONNECTION_REFUSED'].includes(code)) label = '连接被拒绝'
+  else if (['ENETUNREACH', 'EHOSTUNREACH', 'ERR_ADDRESS_UNREACHABLE', 'ERR_INTERNET_DISCONNECTED'].includes(code)) label = '网络不可达'
+  else if (['ERR_PROXY_CONNECTION_FAILED', 'ERR_TUNNEL_CONNECTION_FAILED', 'ERR_SOCKS_CONNECTION_FAILED'].includes(code)) label = '系统代理连接失败'
   else if (/CERT|SELF_SIGNED|UNABLE_TO_VERIFY|UNABLE_TO_GET_ISSUER/.test(code ?? '')) {
     label = '证书验证失败'
     transient = false
@@ -75,17 +80,26 @@ export async function requestJson(url, headers, subject, platform = 'New API') {
   let response
   const signal = AbortSignal.timeout(12000)
   try {
-    response = await fetch(url, { headers, redirect: 'manual', signal })
+    response = await fetchHttp(url, { headers, redirect: 'manual', signal })
     if (response.status >= 300 && response.status < 400)
       throw new ApiError('站点发生跳转，请填写最终的站点网址。')
+    if (response.status === 403) {
+      const challenge = response.headers.get('cf-mitigated') === 'challenge'
+      const html = /^text\/html\b/i.test(response.headers.get('content-type') ?? '')
+      if (challenge || html) {
+        const detail = challenge ? 'Cloudflare 要求浏览器验证' : '站点返回了访问限制网页'
+        throw new ApiError(subject + '：' + detail + '（HTTP 403）。请联系站点管理员核查 API 访问规则。', 403,
+          { label: '站点访问受限 403', authFailure: false })
+      }
+    }
     if (!response.ok)
       throw new ApiError(
         subject +
           '：' +
           ({
-            401: platform === 'SUB2API' ? 'API Key 无效或已过期。' : '令牌无效或已过期，请检查访问令牌及用户 ID。',
+            401: platform === 'New API' ? '令牌无效或已过期，请检查访问令牌及用户 ID。' : 'API Key 无效或已过期。',
             403: '权限不足，请检查令牌的查看权限。',
-            404: '找不到该接口，请检查站点地址与 ' + platform + ' 版本。',
+            404: platform === '自定义接口' ? '找不到余额接口，请检查完整查询地址。' : '找不到该接口，请检查站点地址与 ' + platform + ' 版本。',
           }[response.status] || (httpLabels[response.status] ?? '站点请求失败') + '（HTTP ' + response.status + '）。'),
         response.status,
         { retryAt: retryAfter(response.headers.get('Retry-After')) },
@@ -110,6 +124,9 @@ export async function requestJson(url, headers, subject, platform = 'New API') {
     }
   } catch (error) {
     if (error instanceof ApiError) throw error
+    // Chromium rejects a manual redirect instead of returning the 3xx response.
+    if (error.message === 'Redirect was cancelled')
+      throw new ApiError('站点发生跳转，请填写最终的站点网址。')
     throw transportError(subject, error, signal.aborted)
   } finally {
     if (response?.body && !response.body.locked) await response.body.cancel().catch(() => {})
@@ -202,6 +219,8 @@ export async function querySite({ origin, token, userId }, previous, now = new D
     unit,
     ...usdQuote(status, unit, scale),
     balance: numeric(user.quota) * scale,
+    usedQuota: Number.isFinite(user.used_quota) ? user.used_quota : null,
+    quotaScale: scale,
     usage: false,
     usageNote: '',
     todayValue: null,
@@ -233,7 +252,8 @@ export async function querySite({ origin, token, userId }, previous, now = new D
       return stat ? left + right : left.concat(right)
     }
   }
-  const same = previous?.unit === unit && previous?.accountId === user.id
+  const same = previous?.unit === unit && previous?.accountId === user.id &&
+    (previous.quotaScale == null || previous.quotaScale === scale)
   if (same) {
     data.history = previous.history
     data.historyAt = previous.historyAt || 0

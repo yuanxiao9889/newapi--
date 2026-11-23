@@ -2,8 +2,11 @@ import { DatabaseSync } from 'node:sqlite'
 import { createHash, randomUUID } from 'node:crypto'
 import { ApiError, querySite, readUsdQuote, siteAddress } from './new-api.mjs'
 import { querySub2Api } from './sub2api.mjs'
+import { dailySpend } from './daily-spend.mjs'
+import { customConfig, queryCustom } from './custom-balance.mjs'
 import { emptyMail, mailConfig, mailIdentity, deliver, recipients } from './mail.mjs'
 import { nextRecipient, setRecipients, updateDelivery, needsDeliveryRecovery, recoverDelivery } from './notice-mail.mjs'
+import { integrationAddress, sendFlashduty } from './flashduty.mjs'
 import { siteIdentity } from './config-transfer.mjs'
 
 const copy = structuredClone
@@ -12,6 +15,7 @@ const empty = () => ({
   sites: [],
   notices: [],
   minutes: 15,
+  followSystemProxy: true,
   globalThreshold: null,
   theme: 'system',
   mail: { ...emptyMail },
@@ -39,7 +43,7 @@ function recordFailure(site, error, now, count = (site.issue?.count ?? 0) + 1) {
   const delay = error.status === 429 ? 60000 : pending ? 30000 : 0
   const retryAt = Math.max(delay ? now + delay : 0, error.retryAt || 0)
   site.tried = now
-  site.health = pending ? 'retrying' : [401, 403].includes(error.status) ? 'invalid' : 'offline'
+  site.health = pending ? 'retrying' : error.authFailure ? 'invalid' : 'offline'
   site.issue = {
     label: error.label ?? error.message.replace(/[。.]$/, ''),
     detail: error.message,
@@ -128,19 +132,50 @@ function walletBalances(sites, shared) {
   return wallets
 }
 
+// Show a wallet estimate only once per account and day, when no Key reported spend.
+function walletSpendFallbacks(sites) {
+  const groups = new Map()
+  for (const site of sites.filter((s) => s.provider === 'sub2api')) {
+    const key = walletKey(site)
+    const group = groups.get(key) ?? { reported: new Set(), estimates: new Map() }
+    if (Number.isFinite(site.todayValue)) group.reported.add(site.periodDay)
+    for (const p of site.history ?? []) group.reported.add(p.day)
+    for (const p of site.walletSpend?.history ?? []) {
+      const previous = group.estimates.get(p.day)
+      if (!previous || p.at > previous.point.at) group.estimates.set(p.day, { id: site.id, point: p })
+    }
+    groups.set(key, group)
+  }
+  const result = new Map()
+  for (const { reported, estimates } of groups.values()) {
+    for (const [day, { id, point }] of estimates) {
+      if (reported.has(day)) continue
+      const rows = result.get(id) ?? []
+      rows.push(point)
+      result.set(id, rows)
+    }
+  }
+  return result
+}
+
 export function displayState(state) {
   const shared = sharedWallets(state.sites)
+  const walletSpending = walletSpendFallbacks(state.sites)
   const unread = new Set(state.sites.filter((s) => s.provider === 'sub2api' && !shared.has(walletKey(s))).map(walletKey))
   return { ...state, unreadWalletCount: unread.size, wallets: walletBalances(state.sites, shared), sites: state.sites.map((site) => {
     const source = site.provider === 'sub2api' ? shared.get(walletKey(site))?.latest : site
     const factor = site.autoUsd ? rmbFactor(site, site.fallbackRate) : 1
+    const points = walletSpending.get(site.id) ?? []
+    const walletToday = points.find((p) => p.day === site.periodDay)
     const view = { ...site, accountBalance: source?.balance == null ? null : source.balance * factor,
+      todayValue: walletToday?.value ?? site.todayValue, estimatedSince: walletToday?.since ?? site.estimatedSince,
+      walletSpendEstimate: !!walletToday, history: points.length ? [...site.history, ...points] : site.history,
       walletChecked: source?.checked ?? null, walletSourceId: source?.id ?? null }
     if (!site.autoUsd) return view
     return { ...view, balance: site.balance == null ? null : site.balance * factor,
-      todayValue: site.todayValue == null ? null : site.todayValue * factor,
+      todayValue: view.todayValue == null ? null : view.todayValue * factor,
       monthValue: site.monthValue == null ? null : site.monthValue * factor,
-      history: site.history.map((p) => ({ ...p, value: p.value * factor })),
+      history: view.history.map((p) => ({ ...p, value: p.value * factor })),
     }
   }) }
 }
@@ -157,13 +192,26 @@ function configureAutoUsd(site, data, enabled, fallbackRate) {
   site.fallbackRate = enabled ? fallbackRate ?? null : null
 }
 
+function queryBalance({ provider, origin, custom, userId }, token, previous) {
+  if (provider === 'custom') return queryCustom({ origin, token, custom })
+  if (provider === 'sub2api') return querySub2Api({ origin, token })
+  return querySite({ origin, token, userId }, previous)
+}
+
 function closeNotice(notice, now) {
   notice.closed = now
+  if (['pending', 'failed'].includes(notice.flashduty?.status)) notice.flashduty.status = 'cancelled'
   if (notice.recipients) {
     for (const r of notice.recipients)
       if (['pending', 'failed'].includes(r.delivery)) r.delivery = 'cancelled'
     updateDelivery(notice)
   }
+}
+
+// Older versions queued Flashduty at the first low reading, before email delivery.
+function unconfirmedFlashduty(notice) {
+  return !notice.closed && ['pending', 'failed'].includes(notice.flashduty?.status) &&
+    notice.flashduty.confirmedAt == null
 }
 
 export class Monitor {
@@ -175,7 +223,9 @@ export class Monitor {
     const row = this.db.prepare('SELECT data FROM workspace WHERE id=1').get()
     this.state = row ? JSON.parse(row.data) : empty()
     if (this.state.version !== 1) throw Error('数据库版本不受支持。')
+    this.state.flashduty ??= { enabled: false, configured: false }
     this.state.globalThreshold ??= null
+    this.state.followSystemProxy ??= true
     for (const site of this.state.sites) {
       if (['offline', 'invalid'].includes(site.health) && !site.issue) restoreLegacyIssue(site)
     }
@@ -185,17 +235,20 @@ export class Monitor {
     this.flights = new Map()
     this.tickets = new Map()
     this.sending = false
+    this.sendingFlashduty = false
     const obsoleteLow = this.state.sites.filter((site) => site.provider === 'sub2api' && site.balanceKind !== 'wallet' &&
       (site.low || this.state.notices.some((n) => n.siteId === site.id && !n.closed)))
     const defaultSubIds = new Set(this.state.sites.filter((s) => s.provider === 'sub2api' && !s.autoUsd).map((s) => s.id))
     const legacySubNotice = (n) => !n.closed && n.unit === 'USD' && defaultSubIds.has(n.siteId)
-    if (this.state.notices.some(needsDeliveryRecovery) || obsoleteLow.length || this.state.notices.some(legacySubNotice))
+    if (this.state.notices.some(needsDeliveryRecovery) || obsoleteLow.length ||
+        this.state.notices.some(legacySubNotice) || this.state.notices.some(unconfirmedFlashduty))
       this.change((s) => {
         for (const n of s.notices.filter(legacySubNotice)) {
           n.sourceUnit ??= n.unit
           n.unit = 'CNY'
         }
         for (const n of s.notices.filter(needsDeliveryRecovery)) recoverDelivery(n)
+        for (const n of s.notices.filter(unconfirmedFlashduty)) delete n.flashduty
         for (const old of obsoleteLow) this.evaluateBalance(s, s.sites.find((site) => site.id === old.id), Date.now())
       })
   }
@@ -229,23 +282,31 @@ export class Monitor {
   }
   async probe(input) {
     const provider = input.provider ?? 'new-api'
-    if (!['new-api', 'sub2api'].includes(provider)) throw Error('请选择有效的站点类型。')
-    const origin = siteAddress(input.origin, provider),
-      token = String(input.token ?? '')
-        .trim()
-        .replace(/^Bearer\s+/i, ''),
-      userId = provider === 'sub2api' ? '' : text(input.userId, 24)
+    if (!['new-api', 'sub2api', 'custom'].includes(provider)) throw Error('请选择有效的站点类型。')
+    const origin = siteAddress(input.origin, provider)
+    const custom = provider === 'custom' ? customConfig(input.custom) : undefined
+    const userId = provider === 'new-api' ? text(input.userId, 24) : ''
+    let token = String(input.token ?? '').trim()
+    if (custom?.auth !== 'x-api-key') token = token.replace(/^Bearer\s+/i, '')
+    if (custom && input.id) {
+      const saved = this.state.sites.find((s) => s.id === input.id && s.provider === provider)
+      if (!saved || new URL(saved.origin).origin !== new URL(origin).origin) throw Error('如需查询另一个站点，请单独添加。')
+      if (!token) {
+        if (saved.origin !== origin) throw Error('查询地址已更改，请重新填写 API Key。')
+        token = await this.secret(saved.id)
+      }
+    }
     if (!token || token.length > 8192 || /[\r\n]/.test(token))
-      throw Error(provider === 'sub2api' ? '请输入有效的 API Key。' : '请输入有效的个人访问令牌。')
+      throw Error(provider === 'new-api' ? '请输入有效的个人访问令牌。' : '请输入有效的 API Key。')
     if (userId && !/^[1-9]\d*$/.test(userId)) throw Error('用户 ID 应为正整数。')
-    const data = provider === 'sub2api' ? await querySub2Api({ origin, token }) : await querySite({ origin, token, userId })
-    const keyFingerprint = provider === 'sub2api' ? createHash('sha256').update(token).digest('hex') : undefined
+    const data = await queryBalance({ provider, origin, userId, custom }, token)
+    const keyFingerprint = provider !== 'new-api' ? createHash('sha256').update(token).digest('hex') : undefined
     const ticket = randomUUID(),
       now = Date.now()
     for (const [id, t] of this.tickets)
       if (t.expires <= now || this.tickets.size >= 12) this.tickets.delete(id)
     this.tickets.set(ticket, {
-      provider, keyFingerprint,
+      provider, keyFingerprint, custom,
       origin,
       userId,
       data,
@@ -268,6 +329,7 @@ export class Monitor {
       usageNote: data.usageNote,
       accountId: data.accountId,
       balanceKind: data.balanceKind,
+      balanceScope: data.balanceScope,
       unlimited: data.keyUsage?.unlimited,
     }
   }
@@ -276,15 +338,13 @@ export class Monitor {
     if (!t || t.expires < Date.now()) throw Error('连接测试已过期，请重新测试。')
     const existing = this.state.sites.find((s) => s.id === id)
     const provider = t.provider ?? 'new-api'
-    if (
-      id &&
-      (!existing || existing.origin !== t.origin || (existing.provider ?? 'new-api') !== provider ||
-        existing.accountId !== t.data.accountId)
-    )
+    const sameSite = existing && (provider === 'custom'
+      ? new URL(existing.origin).origin === new URL(t.origin).origin : existing.origin === t.origin)
+    if (id && (!sameSite || (existing.provider ?? 'new-api') !== provider || existing.accountId !== t.data.accountId))
       throw Error('新令牌属于另一个站点或账户，请单独添加。')
     const identity = siteIdentity({ origin: t.origin, provider, keyFingerprint: t.keyFingerprint, accountId: t.data.accountId })
     if (this.state.sites.some((s) => s.id !== id && siteIdentity(s) === identity))
-      throw Error(provider === 'sub2api' ? '该 Key 已经添加。' : '该账户已经添加。')
+      throw Error(provider === 'new-api' ? '该账户已经添加。' : '该 Key 已经添加。')
     const siteId = id || randomUUID()
     this.change((s) => {
       const site = s.sites.find((v) => v.id === siteId) || {
@@ -296,11 +356,14 @@ export class Monitor {
         revision: 0,
       }
       if (!existing) s.sites.push(site)
-      if (autoUsd !== undefined) {
+      if (provider === 'custom') {
+        configureAutoUsd(site, t.data, t.custom.currency === 'USD', fallbackRate)
+      } else if (autoUsd !== undefined) {
         configureAutoUsd(site, t.data, autoUsd, fallbackRate)
       } else if (site.autoUsd) rmbFactor(t.data, site.fallbackRate)
       Object.assign(site, {
         provider,
+        custom: t.custom,
         keyFingerprint: t.keyFingerprint,
         walletGroup: provider === 'sub2api' ? walletGroupName(walletGroup ?? existing?.walletGroup) : undefined,
         origin: t.origin,
@@ -310,23 +373,39 @@ export class Monitor {
         revision: site.revision + 1,
       })
       this.putSecret(siteId, t.cipher)
-      this.apply(s, site, t.data, t.at)
+      const sameMeter = existing && existing.origin === t.origin && existing.keyFingerprint === t.keyFingerprint &&
+        existing.custom?.balancePath === t.custom?.balancePath && existing.unit === t.data.unit
+      if (sameMeter && existing.checked > t.at) {
+        this.evaluateBalance(s, site, Date.now())
+      } else {
+        this.apply(s, site, t.data, t.at, sameMeter ? existing : null)
+      }
     })
     this.tickets.delete(ticket)
     this.dispatch()
     return siteId
   }
-  apply(state, site, data, now) {
-    if (!site.autoUsd && site.unit && site.unit !== data.unit) {
+  apply(state, site, data, now, previous = site) {
+    if (!site.autoUsd && site.provider !== 'custom' && site.unit && site.unit !== data.unit) {
       site.threshold = 0
       log(site, now, state.globalThreshold == null
         ? '站点已更换计价单位，请重新设置低余额阈值。'
         : '站点已更换计价单位，统一预警金额按新单位生效。')
     }
-    Object.assign(site, data, { health: 'ok', checked: now, tried: now })
+    const spend = dailySpend(site.provider, previous, data, now)
+    if (site.provider === 'sub2api') {
+      if (data.balanceKind === 'wallet') {
+        const lastWallet = previous?.balanceKind === 'wallet'
+          ? { ...previous, todayValue: null, estimatedSince: null, history: [], ...previous.walletSpend } : null
+        const wallet = dailySpend('custom', lastWallet, { ...data, todayValue: null, history: [] }, now)
+        const point = wallet.history.at(-1)
+        if (point?.day === wallet.periodDay) Object.assign(point, { at: now, since: wallet.estimatedSince })
+        site.walletSpend = wallet
+      } else delete site.walletSpend
+    }
+    Object.assign(site, data, spend, { health: 'ok', checked: now, tried: now })
     delete site.issue
-    site.history = site.history.slice(-62)
-    const subject = site.provider === 'sub2api' && site.balanceKind !== 'wallet' ? 'Key 用量' : '余额及消费统计'
+    const subject = site.provider === 'custom' ? '余额' : site.provider === 'sub2api' && site.balanceKind !== 'wallet' ? 'Key 用量' : '余额及消费统计'
     log(site, now, '已更新' + subject + (data.usageNote ? '。' + data.usageNote : ''))
     if (site.paused && !(site.provider === 'sub2api' && site.balanceKind !== 'wallet')) return
     this.evaluateBalance(state, site, now)
@@ -356,21 +435,24 @@ export class Monitor {
       }
       setRecipients(notice, state.mail)
       state.notices.unshift(notice)
-    } else if (low && open.delivery === 'off' && state.mail.enabled) {
-      setRecipients(open, state.mail)
+    } else if (low) {
+      if (open.delivery === 'off' && state.mail.enabled) setRecipients(open, state.mail)
     }
   }
   poll(id, force = true) {
     if (this.flights.has(id)) return this.flights.get(id)
     const before = this.state.sites.find((s) => s.id === id)
     if (!before || !pollDue(before, Date.now(), this.state.minutes, force)) return Promise.resolve()
+    // A refresh already in flight when the email is accepted cannot confirm escalation.
+    const emailed = !force && this.state.flashduty.enabled && this.state.mail.enabled
+      ? this.state.notices.find((n) => n.siteId === id && !n.closed && n.delivery === 'sent')
+      : undefined
     const run = (async () => {
       let data, error
       try {
         const token = await this.secret(id)
         if (!token) throw Error('找不到已保存的令牌，请重新填写。')
-        data = before.provider === 'sub2api' ? await querySub2Api({ origin: before.origin, token })
-          : await querySite({ origin: before.origin, userId: before.userId, token }, before)
+        data = await queryBalance(before, token, before)
         if (before.autoUsd) rmbFactor(data, before.fallbackRate)
         if (data.accountId !== before.accountId) throw Error('令牌对应的账户已改变，请重新添加。')
       } catch (e) {
@@ -390,6 +472,14 @@ export class Monitor {
           return
         }
         this.apply(s, site, data, now)
+        if (emailed && site.low && s.mail.enabled && s.flashduty.enabled) {
+          const n = s.notices.find((notice) => notice.id === emailed.id)
+          if (n && !n.closed && n.delivery === 'sent' && (!n.flashduty || n.flashduty.status === 'cancelled')) {
+            n.flashduty = { status: 'pending', attempts: 0, confirmedAt: now,
+              balance: site.autoUsd ? site.balance * rmbFactor(site, site.fallbackRate) : site.balance,
+              threshold: s.globalThreshold ?? site.threshold }
+          }
+        }
       })
       this.dispatch()
     })().finally(() => this.flights.delete(id))
@@ -418,6 +508,7 @@ export class Monitor {
   async setAutoUsd({ id, enabled, fallbackRate }) {
     const before = this.state.sites.find((s) => s.id === id)
     if (!before) throw Error('站点不存在。')
+    if (before.provider === 'custom') throw Error('请在自定义接口设置中修改余额币种和汇率。')
     const quote = enabled && before.usdPerUnit == null ? await readUsdQuote(before) : null
     this.change((state) => {
       const site = state.sites.find((s) => s.id === id)
@@ -452,6 +543,7 @@ export class Monitor {
         log(site, Date.now(), '提醒阈值已更新')
       }
       if (billing !== undefined) {
+        if (site.provider === 'custom') throw Error('请在自定义接口设置中修改余额币种和汇率。')
         if (site.provider === 'sub2api') throw Error('请使用站点详情中的美元换算开关。')
         if (billing !== null && (
           !['USD', site.unit].includes(billing.unit) || billing.unit === 'CNY' ||
@@ -481,6 +573,10 @@ export class Monitor {
   preferences(patch) {
     const thresholdChanged = patch.globalThreshold !== undefined && patch.globalThreshold !== this.state.globalThreshold
     this.change((s) => {
+      if (patch.followSystemProxy !== undefined) {
+        if (typeof patch.followSystemProxy !== 'boolean') throw Error('无效的系统代理设置。')
+        s.followSystemProxy = patch.followSystemProxy
+      }
       if (patch.theme !== undefined) {
         if (!['light', 'dark', 'system'].includes(patch.theme)) throw Error('无效主题')
         s.theme = patch.theme
@@ -547,7 +643,84 @@ export class Monitor {
     this.change((s) => setRecipients(s.notices.find((v) => v.id === id), s.mail, true))
     this.dispatch()
   }
+  async configureFlashduty({ enabled, address = '' }, test = false) {
+    if (typeof enabled !== 'boolean' || typeof address !== 'string') throw Error('无效的 Flashduty 设置。')
+    const typed = address.trim() ? integrationAddress(address) : ''
+    if (test) {
+      const target = typed || await this.secret('flashduty')
+      await sendFlashduty(target, {
+        title_rule: 'QuotaDesk · 测试余额提醒', description: '这是一条测试事件，请确认手机收到短信。',
+        alert_key: 'quotadesk-test-' + randomUUID(), event_status: 'Warning', labels: { source: 'QuotaDesk', kind: 'test' },
+      })
+      return
+    }
+    const cipher = typed ? await this.crypto.encryptStringAsync(typed) : null
+    this.change((state) => this.applyFlashduty(state, enabled, cipher))
+    if (enabled) await this.sweep(true)
+  }
+  applyFlashduty(state, enabled, cipher, clearAddress = false) {
+    if (cipher) this.putSecret('flashduty', cipher)
+    else if (clearAddress) this.db.prepare("DELETE FROM secrets WHERE id='flashduty'").run()
+    const configured = !!cipher || (!clearAddress && state.flashduty.configured)
+    if (enabled && !configured) throw Error('请填写 Flashduty 集成地址。')
+    state.flashduty = { enabled, configured }
+    for (const notice of state.notices) {
+      if (notice.closed || !notice.flashduty) continue
+      if (!enabled && ['pending', 'failed'].includes(notice.flashduty.status)) notice.flashduty.status = 'cancelled'
+      if (enabled && cipher && notice.flashduty.status === 'failed') Object.assign(notice.flashduty, { status: 'pending', attempts: 0 })
+    }
+  }
+  async drainFlashduty() {
+    if (this.sendingFlashduty || !this.state.flashduty.enabled) return
+    this.sendingFlashduty = true
+    try {
+      while (this.state.flashduty.enabled) {
+        const n = this.state.notices.find((notice) => {
+          const job = notice.flashduty
+          return !notice.closed && this.state.mail.enabled && notice.delivery === 'sent' && (job?.status === 'pending' ||
+            (job?.status === 'failed' && job.attempts < 3 && job.retryAt <= Date.now())) &&
+            this.state.sites.some((site) => site.id === notice.siteId && !site.paused && site.low && site.health === 'ok')
+        })
+        if (!n) break
+        // Leave the work pending on disk until acknowledged. A restart uses the same event key.
+        let failure
+        try {
+          const target = await this.secret('flashduty')
+          const current = this.state.notices.find((notice) => notice.id === n.id)
+          if (!current || current.closed || !this.state.flashduty.enabled || current.flashduty?.status === 'cancelled' ||
+              !this.state.mail.enabled || current.delivery !== 'sent') continue
+          const summary = n.site + ' 余额 ' + amount(n.flashduty.balance, n.unit) + '，低于阈值 ' + amount(n.flashduty.threshold, n.unit)
+          await sendFlashduty(target, {
+            title_rule: summary, description: summary, alert_key: 'quotadesk-' + n.id,
+            event_status: 'Warning', event_time: Math.floor(n.flashduty.confirmedAt / 1000),
+            labels: { source: 'QuotaDesk', kind: 'low_balance', site: n.site },
+          })
+        } catch (error) { failure = error }
+        this.change((state) => {
+          const notice = state.notices.find((item) => item.id === n.id)
+          if (!notice) return
+          const attempts = n.flashduty.attempts + 1
+          Object.assign(notice.flashduty, failure ? {
+            status: notice.closed || !state.flashduty.enabled ? 'cancelled' : 'failed',
+            attempts, error: failure.message, retryAt: Date.now() + attempts * 60000,
+          } : { status: 'sent', attempts, error: '' })
+        })
+      }
+    } finally {
+      this.sendingFlashduty = false
+    }
+  }
+  retryFlashduty(id) {
+    this.change((state) => {
+      const n = state.notices.find((notice) => notice.id === id)
+      if (!state.flashduty.enabled || !n || n.closed || n.flashduty?.status !== 'failed')
+        throw Error('当前 Flashduty 事件无法重发。')
+      Object.assign(n.flashduty, { status: 'pending', attempts: 0 })
+    })
+    this.dispatch()
+  }
   dispatch() {
+    this.drainFlashduty().catch((error) => console.error('Flashduty queue:', error.name))
     this.drain().catch((error) => console.error('Mail queue:', error.name))
   }
   async drain() {

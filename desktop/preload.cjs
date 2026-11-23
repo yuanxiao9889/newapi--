@@ -13,6 +13,9 @@ for (const action of [
   'preferences',
   'saveMail',
   'testMail',
+  'saveFlashduty',
+  'testFlashduty',
+  'retryFlashduty',
   'retry',
 ]) {
   api[action] = async (payload) => {

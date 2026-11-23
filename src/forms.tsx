@@ -9,22 +9,29 @@ import {
   Mail as MailIcon,
   Send,
   ShieldCheck,
+  Smartphone,
 } from 'lucide-react'
 import { Button } from '@base-ui/react/button'
 import { Surface } from './visuals'
 import { api, message, type Probe } from './native'
 import {
   balanceLabels,
+  customBalanceLabel,
   deliveryLabel,
   fullTime,
   money,
   unitName,
   walletKeyHint,
+  type Desk,
   type Mail,
   type Site,
   type Notice,
   type Provider,
+  type CustomQuery,
 } from './model'
+
+const tokenMeiUrl = 'https://tokenmei.com/v1/balance'
+const tokenMeiQuery: CustomQuery = { auth: 'bearer', balancePath: 'balance', currency: 'CNY' }
 
 export function AddSite({
   close,
@@ -46,15 +53,33 @@ export function AddSite({
     [busy, setBusy] = useState(false),
     [err, setErr] = useState(''),
     [guide, setGuide] = useState(false)
-  const [autoUsd, setAutoUsd] = useState(existing?.autoUsd ?? false)
+  const [convertUsd, setAutoUsd] = useState(existing?.autoUsd ?? false)
   const [provider, setProvider] = useState<Provider>(existing?.provider ?? 'new-api')
+  const [custom, setCustom] = useState<CustomQuery>(existing?.custom ?? tokenMeiQuery)
   const [walletGroup, setWalletGroup] = useState(existing?.walletGroup ?? '')
   const isSub = provider === 'sub2api'
+  const isCustom = provider === 'custom'
+  const isTokenMei = url === tokenMeiUrl && custom.auth === 'bearer' && custom.balancePath === 'balance' && custom.currency === 'CNY'
+  const autoUsd = isCustom ? custom.currency === 'USD' : convertUsd
   const [fallbackRate, setFallbackRate] = useState(String(existing?.fallbackRate ?? ''))
   const rate = probe?.usdRate ?? Number(fallbackRate)
   const usdBalance = probe?.accountBalance != null && probe.usdPerUnit != null ? probe.accountBalance * probe.usdPerUnit : null
   const canConvert = probe?.usdPerUnit != null && rate > 0 && Number.isFinite((usdBalance ?? 1) * rate)
   const displayUnit = autoUsd || isSub ? 'CNY' : existing?.billing?.unit ?? 'CNY'
+  function selectTemplate(tokenMei: boolean) {
+    setUrl(tokenMei ? tokenMeiUrl : '')
+    setCustom(tokenMeiQuery)
+    setName(tokenMei ? 'TokenMei' : '')
+    setProbe(null)
+    setErr('')
+    setToken('')
+    setFallbackRate('')
+  }
+  function editCustom(patch: Partial<CustomQuery>) {
+    setCustom({ ...custom, ...patch })
+    setProbe(null)
+    setErr('')
+  }
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     if (busy) return
@@ -62,7 +87,7 @@ export function AddSite({
     setBusy(true)
     try {
       if (!probe) {
-        setProbe(await api.probe({ origin: url, token, userId, provider, id: existing?.id, walletGroup }))
+        setProbe(await api.probe({ origin: url, token, userId, provider, custom: isCustom ? custom : undefined, id: existing?.id, walletGroup }))
         return
       }
       const value = globalThreshold ?? Number(threshold)
@@ -88,30 +113,41 @@ export function AddSite({
     }
   }
   return (
-    <Surface name={existing ? '更换访问令牌' : '添加监控站点'} open close={close}>
+    <Surface name={existing ? (isCustom ? '编辑余额接口' : '更换访问令牌') : '添加监控站点'} open close={close}>
       <form className="desktop-site-form" onSubmit={submit}>
         <div className="form-body">
           <fieldset disabled={busy}>
             {!existing && <label className="field">站点类型
               <select value={provider} onChange={(e) => {
-                setProvider(e.target.value as Provider)
+                const next = e.target.value as Provider
+                setProvider(next)
+                if (next === 'custom' || isCustom) selectTemplate(next === 'custom')
+                setToken('')
                 setProbe(null)
                 setErr('')
               }}>
                 <option value="new-api">New API</option>
                 <option value="sub2api">SUB2API</option>
+                <option value="custom">自定义余额接口</option>
+              </select>
+            </label>}
+            {isCustom && !existing && <label className="field">接口预设
+              <select value={isTokenMei ? 'tokenmei' : 'manual'} onChange={(e) => selectTemplate(e.target.value === 'tokenmei')}>
+                <option value="tokenmei">TokenMei</option>
+                <option value="manual">手动配置</option>
               </select>
             </label>}
             <label className="field">
-              站点网址
+              {isCustom ? 'GET 查询地址' : '站点网址'}
               <input
                 autoFocus
-                placeholder="https://api.example.com"
+                placeholder={isCustom ? 'https://api.example.com/v1/balance' : 'https://api.example.com'}
                 required
                 value={url}
-                readOnly={!!existing}
+                readOnly={!!existing && !isCustom}
                 onChange={(e) => {
                   setUrl(e.target.value)
+                  if (isCustom) setToken('')
                   setProbe(null)
                 }}
               />
@@ -119,21 +155,34 @@ export function AddSite({
             {/^http:\/\//i.test(url) && (
               <p className="note">该地址使用 HTTP，访问令牌将通过未加密连接传输。</p>
             )}
+            {isCustom && <div className="field-pair">
+              <label className="field">鉴权方式
+                <select value={custom.auth} onChange={(e) => editCustom({ auth: e.target.value as CustomQuery['auth'] })}>
+                  <option value="bearer">Authorization · Bearer</option>
+                  <option value="x-api-key">X-API-Key</option>
+                </select>
+              </label>
+              <label className="field">JSON 余额字段
+                <input value={custom.balancePath} required maxLength={256} placeholder="例如 data.balance"
+                  onChange={(e) => editCustom({ balancePath: e.target.value })} />
+              </label>
+            </div>}
             <label className="field">
-              {isSub ? 'API Key' : '个人访问令牌'}
+              {provider === 'new-api' ? '个人访问令牌' : 'API Key'}
               <input
                 type="password"
                 autoComplete="off"
-                required
+                required={!isCustom || !existing || existing.origin !== url}
                 value={token}
-                placeholder={isSub ? '粘贴 SUB2API 的 Key' : '粘贴 New API 个人访问令牌'}
+                placeholder={isCustom ? (existing?.origin === url ? '留空沿用已保存的 Key' : '粘贴查询余额的 API Key')
+                  : isSub ? '粘贴 SUB2API 的 Key' : '粘贴 New API 个人访问令牌'}
                 onChange={(e) => {
                   setToken(e.target.value)
                   setProbe(null)
                 }}
               />
             </label>
-            {!isSub && <button
+            {provider === 'new-api' && <button
               type="button"
               className="text-action"
               aria-expanded={guide}
@@ -143,7 +192,7 @@ export function AddSite({
               令牌在哪里创建？
               <ChevronDown size={12} />
             </button>}
-            {!isSub && guide && (
+            {provider === 'new-api' && guide && (
               <p className="note">
                 在 New API 个人设置中创建访问令牌。「个人资料 → 查看」用于读取余额，「用量 →
                 查看」用于读取消费。旧版站点可能还要求控制台中的数字用户 ID。
@@ -158,7 +207,13 @@ export function AddSite({
                   onChange={(e) => setName(e.target.value)}
                 />
               </label>
-              {!isSub && <label className="field">
+              {isCustom && <label className="field">余额币种
+                <select value={custom.currency} onChange={(e) => editCustom({ currency: e.target.value as CustomQuery['currency'] })}>
+                  <option value="CNY">人民币 CNY</option>
+                  <option value="USD">美元 USD</option>
+                </select>
+              </label>}
+              {provider === 'new-api' && <label className="field">
                 用户 ID（旧版站点选填）
                 <input
                   inputMode="numeric"
@@ -178,12 +233,13 @@ export function AddSite({
               </label>}
             </div>
             {isSub && <p className="note">每个账户添加一把能查钱包余额的 Key 即可。同一站点有多个账户时，请分别命名分组。</p>}
-            <label className="toggle threshold-toggle">
+            {isTokenMei && isCustom && <p className="note">主账户 Key 查询主账户余额，子账户 Key 查询自己的额度。同一钱包只需添加一把 Key。</p>}
+            {!isCustom && <label className="toggle threshold-toggle">
               <input type="checkbox" role="switch" checked={autoUsd} onChange={(e) => setAutoUsd(e.target.checked)} />
               <i /> 美元计费，自动折算人民币
-            </label>
+            </label>}
             {autoUsd && (
-              !probe ? <p className="note">测试连接后读取站点汇率，余额、消费和预警均按人民币计算。</p>
+              !probe ? <p className="note">{isCustom ? '测试连接后填写美元汇率，余额和预警按人民币计算。' : '测试连接后读取站点汇率，余额、消费和预警均按人民币计算。'}</p>
               : probe.usdPerUnit == null ? <p className="feedback error">站点缺少美元额度换算参数。</p>
               : probe.usdRate ? <p className="note">站点汇率：1 美元 = {probe.usdRate} 元，每次查询时更新。</p>
               : <label className="field">站点未提供汇率，请填写 1 美元对应的人民币金额
@@ -214,7 +270,7 @@ export function AddSite({
             <div className="feedback good" role="status">
               <CheckCircle2 size={17} />
               <span>
-                {isSub ? '账户钱包余额' : '账户 #' + probe.accountId + ' · 当前余额'} {probe.accountBalance == null
+                {isCustom ? customBalanceLabel(probe.balanceScope) : isSub ? '账户钱包余额' : '账户 #' + probe.accountId + ' · 当前余额'} {probe.accountBalance == null
                   ? '暂不可查' : autoUsd
                   ? canConvert ? money(usdBalance! * rate, 'CNY') + '（' + money(usdBalance!, 'USD') + '）' : '待折算'
                   : money(probe.accountBalance, displayUnit)}
@@ -225,7 +281,7 @@ export function AddSite({
                 </>}
                 {isSub && probe.accountBalance == null && <><br />{walletKeyHint}</>}
                 <br />
-                {probe.usage ? '已读取消费统计' : '暂无消费统计'}
+                {isCustom ? '保存后按余额变化估算今日消费' : probe.usage ? '已读取消费统计' : '暂无平台消费统计'}
                 {probe.usageNote ? ' · ' + probe.usageNote : ''}
               </span>
             </div>
@@ -348,6 +404,57 @@ export function MessagePreview({ notice, close }: { notice: Notice; close: () =>
     </Surface>
   )
 }
+export function FlashdutySettings({ config, inform }: { config: Desk['flashduty']; inform: (message: string) => void }) {
+  const [enabled, setEnabled] = useState(config.enabled)
+  const [address, setAddress] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  async function submit(test: boolean) {
+    if (busy) return
+    setBusy(true)
+    setError('')
+    try {
+      if (test) {
+        await api.testFlashduty({ enabled, address })
+        inform('Flashduty 已接收测试事件，请查看手机或平台通知记录。')
+      } else {
+        await api.saveFlashduty({ enabled, address })
+        setAddress('')
+        inform('Flashduty 设置已保存')
+      }
+    } catch (e) {
+      setError(message(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <section className="panel settings-card">
+      <div className="panel-heading">
+        <h2><Smartphone size={18} /> Flashduty 短信告警</h2>
+        <label className="toggle">
+          <input type="checkbox" checked={enabled} disabled={busy} onChange={(e) => setEnabled(e.target.checked)} />
+          <i />{enabled ? '已启用' : '已关闭'}
+        </label>
+      </div>
+      <div className="settings-content">
+        <label className="field">自定义事件集成地址
+          <input type="password" autoComplete="off" spellCheck={false} value={address} disabled={busy}
+            placeholder={config.configured ? '已保存地址，留空沿用' : '粘贴包含 integration_key 的 HTTPS 地址'}
+            onChange={(e) => { setAddress(e.target.value); setError('') }} />
+          <small>从 Flashduty 的「自定义事件」复制地址，在该协作空间为 Warning 告警启用短信通知。</small>
+        </label>
+        <small>首次低余额先发邮件。发件服务确认接收后，下一次自动查询若仍低于阈值，再发一条短信。手动测试会直接推送事件。</small>
+        {error && <p className="feedback error" role="alert">{error}</p>}
+        <div className="form-buttons">
+          <button className="btn secondary" disabled={busy} onClick={() => submit(true)}><Send size={14} />发送测试事件</button>
+          <button className="btn primary" disabled={busy} onClick={() => submit(false)}>保存 Flashduty 设置</button>
+        </div>
+      </div>
+    </section>
+  )
+}
+
 export function MailSettings({ mail, inform }: { mail: Mail; inform: (s: string) => void }) {
   const [form, setForm] = useState<Mail>({ ...mail }),
     [err, setErr] = useState(''),

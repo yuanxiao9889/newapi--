@@ -2,8 +2,10 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, 
 import { open, rename, rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
+import { integrationAddress } from './flashduty.mjs'
 import { mailConfig } from './mail.mjs'
 import { siteAddress } from './new-api.mjs'
+import { customConfig } from './custom-balance.mjs'
 
 const derive = promisify(scrypt)
 const header = Buffer.from('QuotaDesk config v1\n')
@@ -84,12 +86,15 @@ function siteConfig(s) {
   const { provider = 'new-api', walletGroup = '', autoUsd = false, fallbackRate = null,
     usdPerUnit = null, usdRate = null, balanceKind } = s
   const billing = s.billing == null ? null : { unit: s.billing.unit, rmbRate: s.billing.rmbRate }
-  requireField(['new-api', 'sub2api'].includes(provider) && typeof origin === 'string' && URL.canParse(origin))
-  siteAddress(origin, provider) // Validate even deployment paths already normalized when the site was added.
+  requireField(['new-api', 'sub2api', 'custom'].includes(provider) && typeof origin === 'string' && URL.canParse(origin))
+  const normalized = siteAddress(origin, provider)
+  const custom = provider === 'custom' ? customConfig(s.custom) : undefined
   requireField(typeof name === 'string' && typeof walletGroup === 'string' && typeof userId === 'string' &&
     (!userId || /^[1-9]\d*$/.test(userId)) && typeof paused === 'boolean' && typeof autoUsd === 'boolean')
-  requireField(provider === 'sub2api' ? accountId === null && ['wallet', 'window', 'quota', 'subscription'].includes(balanceKind)
-    : Number.isSafeInteger(accountId) && accountId > 0)
+  if (custom) requireField(accountId === null && unit === custom.currency && !billing &&
+    autoUsd === (unit === 'USD') && usdPerUnit === (autoUsd ? 1 : null) && usdRate === null)
+  else if (provider === 'sub2api') requireField(accountId === null && ['wallet', 'window', 'quota', 'subscription'].includes(balanceKind))
+  else requireField(Number.isSafeInteger(accountId) && accountId > 0)
   requireField(typeof unit === 'string' && unit.length > 0 && Number.isSafeInteger(checked) && checked > 0 &&
     Number.isFinite(threshold) && threshold >= 0 && (Number.isFinite(balance) || (provider === 'sub2api' && balance === null)))
   requireField([usdPerUnit, usdRate, fallbackRate].every((v) => v === null || (Number.isFinite(v) && v > 0)))
@@ -97,32 +102,35 @@ function siteConfig(s) {
   requireField(!autoUsd || (factor > 0 && Number.isFinite(factor) && Number.isFinite(balance * factor)))
   requireField(!billing || (!autoUsd && provider === 'new-api' && [unit, 'USD'].includes(billing.unit) &&
     billing.unit !== 'CNY' && Number.isFinite(billing.rmbRate) && billing.rmbRate > 0 && Number.isFinite(balance * billing.rmbRate)))
-  return { name, origin, provider, userId, accountId, threshold, paused, walletGroup, autoUsd, fallbackRate,
+  return { name, origin: custom ? normalized : origin, provider, custom, userId, accountId, threshold, paused, walletGroup, autoUsd, fallbackRate,
     billing, unit, balance, checked, usdPerUnit, usdRate, balanceKind: provider === 'sub2api' ? balanceKind : undefined }
 }
 
 export async function exportConfig(monitor, password) {
-  const { sites, theme, minutes, globalThreshold, mail } = monitor.state
+  const { sites, theme, minutes, globalThreshold, followSystemProxy, flashduty, mail } = monitor.state
   // Start all local secret reads against the same in-memory snapshot before awaiting decryption.
-  const [entries, mailSecret] = await Promise.all([
+  const [entries, mailSecret, flashdutyAddress] = await Promise.all([
     Promise.all(sites.map(async (s) => {
       const token = await monitor.secret(s.id)
       if (!token) throw Error('站点「' + s.name + '」缺少凭据，请重新填写后导出。')
       return { site: siteConfig(s), token }
     })),
-    monitor.secret('mail'),
+    monitor.secret('mail'), monitor.secret('flashduty'),
   ])
-  return { bytes: await seal({ entries, theme, minutes, globalThreshold, mail, mailSecret }, password), count: entries.length }
+  return { bytes: await seal({ entries, theme, minutes, globalThreshold, followSystemProxy, mail, mailSecret,
+    flashduty: { enabled: flashduty.enabled, address: flashdutyAddress } }, password), count: entries.length }
 }
 
 export function siteIdentity(s) {
-  return JSON.stringify([s.origin, s.provider ?? 'new-api', s.provider === 'sub2api' ? s.keyFingerprint : s.accountId])
+  const provider = s.provider ?? 'new-api'
+  return JSON.stringify([s.origin, provider, provider === 'new-api' ? s.accountId : s.keyFingerprint])
 }
 
 export async function importConfig(monitor, bytes, password, applyPreferences) {
   const data = await unseal(bytes, password)
   requireField(data && Array.isArray(data.entries) && typeof applyPreferences === 'boolean')
   const { theme, minutes, globalThreshold, mailSecret } = data
+  requireField(data.followSystemProxy === undefined || typeof data.followSystemProxy === 'boolean')
   requireField(['system', 'light', 'dark'].includes(theme) && [5, 15, 30, 60].includes(minutes) &&
     (globalThreshold === null || (Number.isFinite(globalThreshold) && globalThreshold >= 0)) &&
     typeof mailSecret === 'string' && data.mail && typeof data.mail.enabled === 'boolean')
@@ -133,17 +141,22 @@ export async function importConfig(monitor, bytes, password, applyPreferences) {
     requireField(entry && entry.site && typeof entry.token === 'string' && entry.token.trim() &&
       entry.token.length <= 8192 && !/[\r\n]/.test(entry.token))
     const site = siteConfig(entry.site)
-    if (site.provider === 'sub2api') site.keyFingerprint = createHash('sha256').update(entry.token).digest('hex')
+    if (site.provider !== 'new-api') site.keyFingerprint = createHash('sha256').update(entry.token).digest('hex')
     prepared.push({ site, cipher: await monitor.crypto.encryptStringAsync(entry.token) })
   }
   const mailCipher = applyPreferences && mailSecret ? await monitor.crypto.encryptStringAsync(mailSecret) : null
+  const fd = data.flashduty
+  if (fd !== undefined) requireField(fd && typeof fd.enabled === 'boolean' && typeof fd.address === 'string' && (!fd.enabled || fd.address))
+  const fdCipher = applyPreferences && fd?.address ? await monitor.crypto.encryptStringAsync(integrationAddress(fd.address)) : null
   let added = 0
   monitor.change((state) => {
     if (applyPreferences) {
-      if (monitor.sending) throw Error('正在发送提醒，请在投递结束后再次导入。')
+      if (monitor.sending || monitor.sendingFlashduty) throw Error('正在发送提醒，请在投递结束后再次导入。')
       const thresholdChanged = state.globalThreshold !== globalThreshold
       Object.assign(state, { minutes, theme, globalThreshold })
+      if (data.followSystemProxy !== undefined) state.followSystemProxy = data.followSystemProxy
       monitor.applyMail(state, mail, mailCipher, true)
+      if (fd) monitor.applyFlashduty(state, fd.enabled, fdCipher, true)
       if (thresholdChanged) for (const s of state.sites) monitor.evaluateBalance(state, s, Date.now())
     }
     const known = new Set(state.sites.map(siteIdentity))

@@ -44,12 +44,14 @@ test('portable encrypted configs merge by account/key, re-encrypt local secrets 
   const first = await add(src, 'new-api', '暂停的站点', 'fixture-new-token')
   await src.updateSite({ id: first, paused: true })
   await add(src, 'sub2api', '共享钱包', 'fixture-sub-key')
-  src.preferences({ theme: 'dark', minutes: 30, globalThreshold: 2 })
+  src.preferences({ theme: 'dark', minutes: 30, globalThreshold: 2, followSystemProxy: false })
   await src.configure({ config: { ...emptyMail, provider: 'resend', from: 'from@example.test', to: 'one@example.test' },
     secret: 'fixture-mail-secret' })
+  const fdAddress = 'https://api.flashcat.cloud/event/push/alert/standard?integration_key=fixture-transfer'
+  await src.configureFlashduty({ enabled: false, address: fdAddress })
   const { bytes, count } = await exportConfig(src, password)
   assert.equal(count, 2)
-  for (const value of ['fixture-new-token', 'fixture-mail-secret', 'fixture-sub-key', 'fixture.test', 'example.test'])
+  for (const value of ['fixture-new-token', 'fixture-mail-secret', 'fixture-sub-key', 'fixture-transfer', 'fixture.test', 'example.test'])
     assert.ok(!bytes.includes(Buffer.from(value)))
   assert.notDeepEqual(bytes, (await exportConfig(src, password)).bytes)
   const dir = await mkdtemp(join(tmpdir(), 'quotadesk-config-'))
@@ -60,6 +62,9 @@ test('portable encrypted configs merge by account/key, re-encrypt local secrets 
   assert.deepEqual(await readdir(dir), ['config.qdconfig'])
   assert.deepEqual(await importConfig(dest, await readConfigFile(file), password, true), { added: 2, skipped: 0 })
   const [newApi, sub] = dest.state.sites
+  assert.equal(dest.state.followSystemProxy, false)
+  assert.equal(await dest.secret('flashduty'), fdAddress)
+  assert.deepEqual(dest.state.flashduty, { enabled: false, configured: true })
   assert.deepEqual([newApi.paused, newApi.userId, newApi.threshold, newApi.autoUsd, sub.walletGroup],
     [true, '42', 7, true, '分组一'])
   assert.deepEqual([dest.state.theme, dest.state.minutes, dest.state.globalThreshold, dest.state.mail.to],
@@ -71,10 +76,11 @@ test('portable encrypted configs merge by account/key, re-encrypt local secrets 
   await dest.sweep()
   assert.deepEqual(dest.state.sites.map((s) => s.health), ['pending', 'ok'])
   assert.equal(displayState(dest.state).sites[1].accountBalance, 210)
-  dest.preferences({ theme: 'light' })
+  dest.preferences({ theme: 'light', followSystemProxy: true })
   dest.change((s) => { s.sites[0].name = '保留本机备注' })
   assert.deepEqual(await importConfig(dest, bytes, password, false), { added: 0, skipped: 2 })
   assert.deepEqual([dest.state.theme, dest.state.sites[0].name], ['light', '保留本机备注'])
+  assert.equal(dest.state.followSystemProxy, true)
 })
 
 test('incorrect passwords, corrupt files and partial database writes leave the destination intact', async (t) => {
@@ -100,4 +106,72 @@ test('incorrect passwords, corrupt files and partial database writes leave the d
   assert.deepEqual(dest.state, original)
   assert.equal(await dest.secret('mail'), 'local-original')
   assert.equal(dest.db.prepare('SELECT COUNT(*) AS n FROM secrets').get().n, 1)
+})
+
+test('custom balance monitors keep their query, key and alert behavior across configuration transfer', async (t) => {
+  const src = machine(t, 'source'), dest = machine(t, 'target')
+  const origin = 'https://fixture.test/v1/balance'
+  const custom = { auth: 'bearer', balancePath: 'balance', currency: 'CNY' }
+  const input = { provider: 'custom', token: 'fixture-custom-key', origin, custom }
+  let amount = '12.50', scope = 'tenant'
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(url, origin)
+    assert.equal(options.headers.Authorization, 'Bearer fixture-custom-key')
+    assert.equal(options.redirect, 'manual')
+    return Response.json({ object: 'balance', balance: amount, currency: 'CNY', scope })
+  })
+  const probe = await src.probe(input)
+  assert.deepEqual([probe.accountBalance, probe.balanceScope, probe.usage], [12.5, 'tenant', false])
+  const id = src.saveSite({ ticket: probe.ticket, threshold: 5, name: 'TokenMei' })
+  const duplicate = await src.probe(input)
+  assert.throws(() => src.saveSite({ ticket: duplicate.ticket, threshold: 0 }), /已经添加/)
+  const { bytes } = await exportConfig(src, password)
+  assert.ok(!bytes.includes(Buffer.from(input.token)))
+  assert.deepEqual(await importConfig(dest, bytes, password, false), { added: 1, skipped: 0 })
+  assert.deepEqual(await importConfig(dest, bytes, password, false), { added: 0, skipped: 1 })
+  const importedId = dest.state.sites[0].id
+  amount = '-0.45'
+  scope = 'sub_account'
+  await dest.sweep()
+  const view = displayState(dest.state)
+  assert.deepEqual(view.sites[0].custom, custom)
+  assert.deepEqual(view.wallets, [{ unit: 'CNY', value: -0.45, rmb: -0.45 }])
+  assert.equal(view.sites[0].balanceScope, 'sub_account')
+  assert.deepEqual([view.sites[0].todayValue, view.sites[0].monthValue, view.sites[0].history], [null, null, []])
+  assert.equal(view.notices[0].balance, -0.45)
+  for (const invalid of ['', false, null, 'N/A', {}, '1e999']) {
+    amount = invalid
+    await dest.refreshSite(importedId)
+    assert.equal(dest.state.sites[0].health, 'offline')
+    assert.equal(dest.state.sites[0].balance, -0.45)
+  }
+  amount = '0.00'
+  await dest.refreshSite(importedId)
+  assert.equal(dest.state.sites[0].balance, 0)
+  const edited = await src.probe({ ...input, id, token: '' })
+  assert.equal(edited.balance, 0)
+  await assert.rejects(src.probe({ ...input, id, token: '', origin: origin + '/changed' }), /重新填写/)
+  await assert.rejects(src.probe({ ...input, id, origin: 'https://elsewhere.test' }), /另一个站点/)
+})
+
+test('custom queries support nested numeric fields, X-API-Key and dollar balances', async (t) => {
+  const mon = machine(t, 'source')
+  const custom = { auth: 'x-api-key', balancePath: 'data.0.available', currency: 'USD' }
+  const input = { provider: 'custom', origin: 'https://fixture.test/prefix/v1/', custom, token: 'fixture-api-key' }
+  t.mock.method(globalThis, 'fetch', async (url, { headers }) => {
+    assert.equal(url, input.origin)
+    assert.equal(headers['X-API-Key'], input.token)
+    assert.equal(headers.Authorization, undefined)
+    return Response.json({ data: [{ available: 2 }] })
+  })
+  const { ticket } = await mon.probe(input)
+  assert.throws(() => mon.saveSite({ ticket, threshold: 0 }), /换算参数/)
+  mon.saveSite({ ticket, threshold: 20, fallbackRate: 7 })
+  assert.equal(displayState(mon.state).sites[0].accountBalance, 14)
+  assert.equal(mon.state.notices[0].unit, 'CNY')
+  const dest = machine(t, 'target')
+  await importConfig(dest, (await exportConfig(mon, password)).bytes, password, false)
+  await dest.sweep()
+  assert.deepEqual(displayState(dest.state).wallets, [{ unit: 'CNY', value: 14, rmb: 14 }])
+  await assert.rejects(mon.probe({ ...input, custom: { ...custom, balancePath: 'data.missing' } }), /找不到/)
 })

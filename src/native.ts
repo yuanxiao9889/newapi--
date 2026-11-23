@@ -1,4 +1,4 @@
-import type { BalanceKind, Desk, Mail, Provider, Site, Unit } from './model'
+import type { BalanceKind, BalanceScope, CustomQuery, Desk, Mail, Provider, Site, Unit } from './model'
 export type Probe = {
   ticket: string
   unit: Unit
@@ -6,6 +6,7 @@ export type Probe = {
   accountBalance: number | null
   sharedWalletAt: number | null
   balanceKind?: BalanceKind
+  balanceScope?: BalanceScope
   unlimited?: boolean
   usdRate: number | null
   usdPerUnit: number | null
@@ -20,7 +21,7 @@ interface Native {
   openSite(p: { id: string }): Promise<void>
   setAutoUsd(p: { id: string; enabled: boolean; fallbackRate: number | null }): Promise<void>
   onChange(fn: (state: Desk) => void): () => void
-  probe(p: { origin: string; token: string; userId: string; provider: Provider; id?: string; walletGroup?: string }): Promise<Probe>
+  probe(p: { origin: string; token: string; userId: string; provider: Provider; custom?: CustomQuery; id?: string; walletGroup?: string }): Promise<Probe>
   saveSite(p: { id?: string; ticket: string; name: string; threshold: number;
     autoUsd?: boolean; fallbackRate?: number | null; walletGroup?: string }): Promise<string>
   updateSite(p: {
@@ -32,9 +33,12 @@ interface Native {
     remove?: boolean
   }): Promise<void>
   refresh(p?: { id: string }): Promise<void>
-  preferences(p: Partial<Pick<Desk, 'theme' | 'minutes' | 'globalThreshold'>>): Promise<void>
+  preferences(p: Partial<Pick<Desk, 'theme' | 'minutes' | 'globalThreshold' | 'followSystemProxy'>>): Promise<void>
   saveMail(p: { config: Mail; secret: string }): Promise<void>
   testMail(p: { config: Mail; secret: string }): Promise<number>
+  saveFlashduty(p: { enabled: boolean; address: string }): Promise<void>
+  testFlashduty(p: { enabled: boolean; address: string }): Promise<void>
+  retryFlashduty(p: { id: string }): Promise<void>
   retry(p: { id: string }): Promise<void>
 }
 declare global {

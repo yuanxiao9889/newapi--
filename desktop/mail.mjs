@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer'
+import { fetchHttp } from './http.mjs'
 
 const addressPattern = /^[^\s\x00-\x1f\x7f@,;，；<>()"\\:]+@[^\s\x00-\x1f\x7f@,;，；<>()"\\:]+\.[^\s\x00-\x1f\x7f@,;，；<>()"\\:]+$/u
 
@@ -53,7 +54,7 @@ export async function deliver(cfg, secret, message) {
     if (!secret) throw Error('请输入 Resend API Key。')
     let res
     try {
-      res = await fetch('https://api.resend.com/emails', {
+      res = await fetchHttp('https://api.resend.com/emails', {
         method: 'POST',
         redirect: 'error',
         signal: AbortSignal.timeout(15000),

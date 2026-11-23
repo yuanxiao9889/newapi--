@@ -3,7 +3,12 @@ export type Theme = 'system' | 'light' | 'dark'
 export type Clock = 5 | 15 | 30 | 60
 export type Health = 'ok' | 'pending' | 'retrying' | 'invalid' | 'offline'
 export type History = { day: string; value: number }
-export type Provider = 'new-api' | 'sub2api'
+export type Provider = 'new-api' | 'sub2api' | 'custom'
+export type CustomQuery = { auth: 'bearer' | 'x-api-key'; balancePath: string; currency: 'CNY' | 'USD' }
+export type BalanceScope = 'tenant' | 'sub_account' | null
+export function customBalanceLabel(scope?: BalanceScope) {
+  return scope === 'tenant' ? '主账户可用余额' : scope === 'sub_account' ? '子账户可用余额' : '可用余额'
+}
 export type BalanceKind = 'wallet' | 'quota' | 'window' | 'subscription'
 export const balanceLabels: Record<BalanceKind, string> = {
   wallet: '账户共享余额', quota: 'Key 剩余额度', window: 'Key 周期限额', subscription: '订阅剩余额度',
@@ -25,6 +30,8 @@ export type Site = {
   usdRate?: number | null
   fallbackRate?: number | null
   provider?: Provider
+  custom?: CustomQuery
+  balanceScope?: BalanceScope
   balance: number | null
   accountBalance: number | null
   walletChecked: number | null
@@ -48,6 +55,8 @@ export type Site = {
   accountId: number | null
   usageNote: string
   todayValue: number | null
+  estimatedSince?: number | null
+  walletSpendEstimate?: boolean
   monthValue: number | null
   periodDay: string
   history: History[]
@@ -62,6 +71,7 @@ export type Notice = {
   threshold: number
   unit: Unit
   closed?: number
+  flashduty?: { status: 'sent' | 'pending' | 'failed' | 'cancelled'; error?: string }
   destination: string
   delivery: 'off' | 'sent' | 'pending' | 'failed' | 'sending' | 'uncertain' | 'cancelled'
   recipients?: { id: string; address: string; selected: boolean; delivery: Notice['delivery']; error?: string }[]
@@ -85,8 +95,10 @@ export type Desk = {
   unreadWalletCount: number
   notices: Notice[]
   minutes: Clock
+  followSystemProxy: boolean
   theme: Theme
   mail: Mail
+  flashduty: { enabled: boolean; configured: boolean }
 }
 export const unitSymbol = (unit: Unit) =>
   unit === 'CNY' ? '¥' : unit === 'USD' ? '$' : unit.split('@')[0]
@@ -169,6 +181,13 @@ export function periodAvailable(site: Site, period: 'today' | 'month') {
   return period === 'today'
     ? site.periodDay === date && site.todayValue != null
     : site.periodDay.slice(0, 7) === date.slice(0, 7) && site.monthValue != null
+}
+export function estimateLabel(site: Site) {
+  if (site.estimatedSince == null) return ''
+  const from = new Date(site.estimatedSince)
+  const scope = site.walletSpendEstimate ? '账户钱包估算' : '估算'
+  return dayKey(from) === site.periodDay && (from.getHours() || from.getMinutes())
+    ? time(site.estimatedSince) + ' 起' + scope : scope
 }
 export function stateLabel(site: Site) {
   if (site.paused) return ['paused', '已暂停']

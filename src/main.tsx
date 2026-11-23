@@ -24,7 +24,7 @@ import {
   Wallet,
 } from 'lucide-react'
 import { Overview, SiteTable, type FilterKey } from './dashboard'
-import { AddSite, MailSettings, MessagePreview, ThresholdSettings } from './forms'
+import { AddSite, FlashdutySettings, MailSettings, MessagePreview, ThresholdSettings } from './forms'
 import { Detail } from './detail'
 import { ConfigTransfer } from './config-transfer'
 import { api, message } from './native'
@@ -179,7 +179,7 @@ function App({ desk }: { desk: Desk }) {
       setLoading(false)
     }
   }
-  function settings(patch: Partial<Pick<Desk, 'theme' | 'minutes'>>) {
+  function settings(patch: Partial<Pick<Desk, 'theme' | 'minutes' | 'followSystemProxy'>>) {
     api.preferences(patch).catch((e) => inform(message(e)))
   }
   const nav = (p: Page) => {
@@ -293,13 +293,13 @@ function App({ desk }: { desk: Desk }) {
                     已接入 {desk.sites.length} 个站点
                   </>
                 ) : page === 'sites' ? (
-                  '查看和管理 New API 账户与 SUB2API Key'
+                  '管理已接入的账户、Key 和自定义余额接口'
                 ) : page === 'alerts' ? (
                   '查看各站点的低余额提醒与恢复记录'
                 ) : page === 'mail' ? (
-                  '为所有站点配置统一的邮件提醒'
+                  '配置低余额邮件和 Flashduty 短信告警'
                 ) : (
-                  '设置本机外观与自动查询频率'
+                  '管理本机外观、自动查询频率和系统代理'
                 )}
               </p>
             </div>
@@ -314,6 +314,7 @@ function App({ desk }: { desk: Desk }) {
                 {page === 'home' && (
                   <UnitPicker unit={unit} units={availableUnits.length ? availableUnits : [unit]} onChange={setUnit} />
                 )}
+                {page === 'sites' && <ConfigTransfer empty={desk.sites.length === 0} inform={inform} />}
                 <button className="btn primary" onClick={add}>
                   <Plus size={17} />
                   添加站点
@@ -327,18 +328,18 @@ function App({ desk }: { desk: Desk }) {
                 <Wallet size={31} />
               </div>
               <h2>添加第一个监控站点</h2>
-              <p>使用 New API 个人访问令牌或 SUB2API Key，查看余额、消费和低余额提醒。</p>
+              <p>接入 New API、SUB2API 或自定义余额接口，查看账户余额并设置低余额提醒。</p>
               <button className="btn primary" onClick={add}>
                 <Plus size={16} />
                 连接第一个站点
               </button>
             </section>
           )}
-          {page === 'home' && desk.sites.length > 0 && !desk.mail.enabled && (
+          {page === 'home' && desk.sites.length > 0 && !desk.mail.enabled && !desk.flashduty.enabled && (
             <div className="mail-setup-note">
               <Mail size={15} />
-              <span>尚未启用低余额邮件提醒</span>
-              <button onClick={() => go('mail')}>配置邮件</button>
+              <span>尚未启用低余额通知</span>
+              <button onClick={() => go('mail')}>配置通知</button>
             </div>
           )}
           {page === 'home' && desk.sites.length > 0 && (
@@ -407,6 +408,19 @@ function App({ desk }: { desk: Desk }) {
                         {n.closed ? ' · 恢复于 ' + fullTime(n.closed) : ''}
                       </p>
                     </div>
+                    {n.flashduty && (
+                      <small className="muted" title={n.flashduty.error}>
+                        Flashduty · {deliveryLabel[n.flashduty.status]}
+                      </small>
+                    )}
+                    {!n.flashduty && !n.closed && desk.flashduty.enabled && (
+                      <small className="muted">短信 · {n.delivery === 'sent' && desk.mail.enabled ? '等待下次自动查询' : '等待邮件发送成功'}</small>
+                    )}
+                    {desk.flashduty.enabled && !n.closed && n.flashduty?.status === 'failed' && (
+                      <button className="btn secondary" onClick={() => api.retryFlashduty({ id: n.id }).catch((e) => inform(message(e)))}>
+                        重发事件
+                      </button>
+                    )}
                     {!n.closed &&
                       desk.mail.enabled &&
                       ['failed', 'uncertain'].includes(n.delivery) && (
@@ -422,7 +436,7 @@ function App({ desk }: { desk: Desk }) {
                         <Mail size={14} />
                         {deliveryLabel[n.delivery]}
                       </button>
-                    ) : (
+                    ) : !n.flashduty && (
                       <small className="muted">邮件已关闭</small>
                     )}
                   </div>
@@ -437,7 +451,10 @@ function App({ desk }: { desk: Desk }) {
               )}
             </section>
           )}
-          {page === 'mail' && <MailSettings mail={desk.mail} inform={inform} />}
+          {page === 'mail' && <>
+            <FlashdutySettings config={desk.flashduty} inform={inform} />
+            <MailSettings mail={desk.mail} inform={inform} />
+          </>}
           {page === 'settings' && (
             <section className="panel settings-card">
               <div className="panel-heading">
@@ -480,7 +497,12 @@ function App({ desk }: { desk: Desk }) {
                   关闭窗口后，QuotaDesk
                   会在系统托盘继续查询。电脑从休眠恢复时会补查到期站点；在托盘菜单中选择「退出并停止监控」可完全退出。
                 </p>
-                <ConfigTransfer empty={desk.sites.length === 0} />
+                <label className="toggle">
+                  <input type="checkbox" role="switch" checked={desk.followSystemProxy}
+                    aria-describedby="proxy-description" onChange={(e) => settings({ followSystemProxy: e.target.checked })} />
+                  <i />跟随系统代理
+                </label>
+                <p className="note" id="proxy-description">开启时，站点查询和 Resend 邮件使用 Windows 系统代理设置。关闭后直接连接。</p>
               </div>
             </section>
           )}
@@ -512,7 +534,7 @@ function App({ desk }: { desk: Desk }) {
             setAdding(false)
             setUnit(unit)
             setDetail(id)
-            inform(replacing ? '令牌已更新' : '站点已保存，监控已启动')
+            inform(replacing ? (replacing.provider === 'custom' ? '余额接口已更新' : '令牌已更新') : '站点已保存，监控已启动')
           }}
         />
       )}

@@ -14,6 +14,7 @@ import {
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Monitor, displayState } from './monitor.mjs'
+import { configureHttp } from './http.mjs'
 import { exportConfig, importConfig, readConfigFile, writeConfigFile } from './config-transfer.mjs'
 
 const appLabel = app.isPackaged ? 'QuotaDesk' : 'QuotaDesk 开发版'
@@ -84,7 +85,7 @@ if (!app.requestSingleInstanceLock()) {
       if (reason === 'quit' || !waiting) pendingExit = reason
       if (waiting) return
       clearInterval(timer)
-      while (activeRequests || monitor?.sending || monitor?.flights.size)
+      while (activeRequests || monitor?.sending || monitor?.sendingFlashduty || monitor?.flights.size)
         await new Promise((done) => setTimeout(done, 100))
       quitting = true
       app.exit(pendingExit === 'quit' ? 0 : window?.isVisible() ? 75 : 76)
@@ -105,7 +106,7 @@ if (!app.requestSingleInstanceLock()) {
   })
   app
     .whenReady()
-    .then(() => {
+    .then(async () => {
       Menu.setApplicationMenu(null)
       session.defaultSession.setPermissionRequestHandler((_wc, _perm, respond) => respond(false))
       monitor = new Monitor(
@@ -118,6 +119,7 @@ if (!app.requestSingleInstanceLock()) {
           )
         },
       )
+      await configureHttp(session, () => monitor.state.followSystemProxy)
       const configFilters = [{ name: 'QuotaDesk 加密配置', extensions: ['qdconfig'] }]
       const actions = {
         state: () => displayState(monitor.state),
@@ -144,7 +146,7 @@ if (!app.requestSingleInstanceLock()) {
           const url = new URL(site.origin)
           if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
             throw Error('站点网址无效。')
-          return shell.openExternal(url.href)
+          return shell.openExternal(site.provider === 'custom' ? url.origin : url.href)
         },
         probe: (x) => monitor.probe(x),
         saveSite: (x) => monitor.saveSite(x),
@@ -154,6 +156,9 @@ if (!app.requestSingleInstanceLock()) {
         preferences: (x) => monitor.preferences(x),
         saveMail: (x) => monitor.configure(x),
         testMail: (x) => monitor.configure(x, true),
+        saveFlashduty: (x) => monitor.configureFlashduty(x),
+        testFlashduty: (x) => monitor.configureFlashduty(x, true),
+        retryFlashduty: (x) => monitor.retryFlashduty(x.id),
         retry: (x) => monitor.retry(x.id),
       }
       for (const [name, handler] of Object.entries(actions)) {

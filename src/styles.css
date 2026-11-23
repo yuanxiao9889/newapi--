@@ -1524,6 +1524,7 @@ tbody tr:hover {
 .settings-card {
   max-width: 730px;
 }
+.settings-card + .settings-card { margin-top: 20px; }
 .settings-card > .panel-heading {
   padding: 19px 21px;
   border-bottom: 1px solid var(--edge);

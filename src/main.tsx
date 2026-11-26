@@ -12,6 +12,7 @@ import {
   Inbox,
   Layers3,
   LayoutDashboard,
+  TrendingUp,
   Mail,
   Monitor,
   Moon,
@@ -26,6 +27,7 @@ import {
 import { Overview, SiteTable, type FilterKey } from './dashboard'
 import { AddSite, FlashdutySettings, MailSettings, MessagePreview, ThresholdSettings } from './forms'
 import { Detail } from './detail'
+import { ProfitPage } from './profit'
 import { ConfigTransfer } from './config-transfer'
 import { api, message } from './native'
 import {
@@ -42,10 +44,11 @@ import {
 } from './model'
 import './styles.css'
 
-type Page = 'home' | 'sites' | 'alerts' | 'mail' | 'settings'
+type Page = 'home' | 'sites' | 'profit' | 'alerts' | 'mail' | 'settings'
 const pageNames: Record<Page, string> = {
   home: '费用总览',
   sites: '站点管理',
+  profit: '利润',
   alerts: '提醒记录',
   mail: '通知设置',
   settings: '偏好设置',
@@ -53,6 +56,7 @@ const pageNames: Record<Page, string> = {
 const navItems = {
   home: LayoutDashboard,
   sites: Layers3,
+  profit: TrendingUp,
   alerts: Bell,
   mail: Mail,
   settings: Settings2,
@@ -137,8 +141,8 @@ function App({ desk }: { desk: Desk }) {
   const availableUnits = [...new Set(sites.map((s) => s.unit))]
   const unit = availableUnits.includes(chosenUnit) ? chosenUnit : availableUnits[0] || chosenUnit
   const openAlerts = desk.notices.filter((n) => !n.closed).length
-  const active = desk.sites.filter((s) => !s.paused).length
-  const last = Math.max(0, ...desk.sites.map((s) => s.tried))
+  const active = desk.sites.filter((s) => !s.paused).length + (desk.profit ? 1 : 0)
+  const last = Math.max(desk.profit?.checked ?? 0, ...desk.sites.map((s) => s.tried))
   useEffect(() => {
     const media = matchMedia('(prefers-color-scheme: dark)')
     const apply = () => {
@@ -215,7 +219,7 @@ function App({ desk }: { desk: Desk }) {
         <Brand />
         <nav>
           <small className="nav-caption">工作空间</small>
-          {(['home', 'sites', 'alerts'] as const).map(nav)}
+          {(['home', 'sites', 'profit', 'alerts'] as const).map(nav)}
           <small className="nav-caption second">设置</small>
           {(['mail', 'settings'] as const).map(nav)}
         </nav>
@@ -294,6 +298,8 @@ function App({ desk }: { desk: Desk }) {
                   </>
                 ) : page === 'sites' ? (
                   '管理已接入的账户、Key 和自定义余额接口'
+                ) : page === 'profit' ? (
+                  '全站用户净消费减去其他监控站点的用量成本，统一按人民币统计'
                 ) : page === 'alerts' ? (
                   '查看各站点的低余额提醒与恢复记录'
                 ) : page === 'mail' ? (
@@ -369,6 +375,7 @@ function App({ desk }: { desk: Desk }) {
               add={add}
             />
           )}
+          {page === 'profit' && <ProfitPage book={desk.profit} refresh={refresh} loading={loading} />}
           {page === 'alerts' && (
             <section className="panel alerts-panel">
               <div className="table-tools">

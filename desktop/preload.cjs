@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 const api = {}
 for (const action of [
   'state',
+  'saveProfitSource',
   'exportConfig',
   'importConfig',
   'openSite',

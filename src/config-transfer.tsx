@@ -29,7 +29,7 @@ export function ConfigTransfer({ empty, inform }: { empty: boolean; inform: (mes
       if (exporting) {
         const saved = await api.exportConfig({ password })
         if (!saved) return
-        inform('已导出配置，包含 ' + saved.count + ' 个站点。')
+        inform('已导出完整备份，包含 ' + saved.count + ' 个站点、监控记录和通知设置。')
       } else {
         const imported = await api.importConfig({ password, applyPreferences })
         if (!imported) return
@@ -50,8 +50,8 @@ export function ConfigTransfer({ empty, inform }: { empty: boolean; inform: (mes
       <form onSubmit={submit}>
         <div className="form-body">
           <p className="note">{exporting
-            ? '文件包含站点令牌、通知凭据和偏好设置。请记住密码，换机导入时需要输入。'
-            : '输入导出时设置的密码，然后选择 .qdconfig 文件。同一站点已有的账户或 Key 会自动跳过。'}</p>
+            ? '加密备份包含站点及凭据、消费历史、查询日志、利润账本及管理员令牌、提醒和投递记录、通知配置与个人偏好。换机恢复时需要此密码。'
+            : '输入密码并选择 .qdconfig 文件。新站点及其记录会一起恢复。已有账户或 Key 会跳过，利润账本仅在本机尚未接入收入站时恢复。也支持旧版配置文件。'}</p>
           <label className="field">文件密码
             <input type="password" required autoFocus minLength={8} maxLength={1024} disabled={busy}
               autoComplete={exporting ? 'new-password' : 'off'} placeholder={exporting ? '至少 8 个字符' : '输入导出密码'}
@@ -63,7 +63,7 @@ export function ConfigTransfer({ empty, inform }: { empty: boolean; inform: (mes
           </label> : <label className="toggle">
             <input type="checkbox" checked={applyPreferences} disabled={busy}
               onChange={(e) => setApplyPreferences(e.target.checked)} /><i />
-            使用文件中的主题、查询频率、系统代理、统一预警金额和通知设置
+            使用备份中的个人偏好、统一预警金额、邮件和 Flashduty 短信配置
           </label>}
           {error && <p className="feedback error" role="alert">{error}</p>}
         </div>

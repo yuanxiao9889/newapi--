@@ -88,6 +88,7 @@ export type Mail = {
   tls: 'STARTTLS' | 'TLS'
 }
 export type Desk = {
+  profit: ProfitBook | null
   globalThreshold: number | null
   version: 1
   sites: Site[]
@@ -99,6 +100,14 @@ export type Desk = {
   theme: Theme
   mail: Mail
   flashduty: { enabled: boolean; configured: boolean }
+}
+export type ProfitDay = {
+  day: string; revenue: number | null; cost: number; profit: number | null
+  estimated: boolean; missing: string[]
+}
+export type ProfitBook = {
+  origin: string; userId: string; rate: number | null; start: string; checked: number
+  error: string; days: ProfitDay[]
 }
 export const unitSymbol = (unit: Unit) =>
   unit === 'CNY' ? '¥' : unit === 'USD' ? '$' : unit.split('@')[0]

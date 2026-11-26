@@ -599,6 +599,15 @@ main {
   border-radius: 12px;
   box-shadow: var(--shadow);
 }
+.profit-page { display: grid; gap: 18px; }
+.profit-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.profit-source { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px; }
+.profit-source h2 { margin-bottom: 6px; }
+.profit-source .feedback { flex-basis: 100%; }
+.profit-note { white-space: normal; min-width: 120px; }
+@media (max-width: 760px) {
+  .profit-stats { grid-template-columns: 1fr; }
+}
 .stat {
   position: relative;
   min-width: 0;

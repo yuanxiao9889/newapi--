@@ -9,6 +9,115 @@ import { Monitor, displayState } from '../desktop/monitor.mjs'
 import { querySite, requestJson, siteAddress } from '../desktop/new-api.mjs'
 import { deliver, emptyMail, mailConfig } from '../desktop/mail.mjs'
 import { querySub2Api } from '../desktop/sub2api.mjs'
+import { saveProfitSource } from '../desktop/profit.mjs'
+import { exportConfig, importConfig } from '../desktop/config-transfer.mjs'
+
+test('admin profit persists net site-wide revenue and reconciles each local calendar day once', async (t) => {
+  const crypto = { encryptStringAsync: async v => Buffer.from(v), decryptStringAsync: async v => ({ result: v.toString() }) }
+  const dir = await mkdtemp(join(tmpdir(), 'quotadesk-profit-'))
+  const database = join(dir, 'profit.sqlite')
+  let m = new Monitor(database, crypto)
+  t.after(async () => { m.db.close(); await rm(dir, { recursive: true, force: true }) })
+  const at = (day, hour) => new Date(2026, 0, day, hour).getTime()
+  let now = at(31, 14), denied = false, missCost = false, todayQuota = 112
+  t.mock.method(Date, 'now', () => now)
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (input, options) => {
+    const u = new URL(input)
+    const ok = data => Response.json({ success: true, data })
+    if (u.pathname === '/api/status') {
+      assert.ok(!options.headers.Authorization)
+      return ok({ quota_display_type: 'USD', quota_per_unit: 8, usd_exchange_rate: 7 })
+    }
+    assert.equal(u.searchParams.get('type'), '2')
+    const end = Number(u.searchParams.get('end_timestamp'))
+    if (u.host === 'income.test') {
+      assert.equal(u.pathname, '/api/log/stat')
+      assert.equal(options.headers['New-Api-User'], '23')
+      assert.equal(options.headers.Authorization, 'Bearer fixture-admin')
+      assert.ok(!u.searchParams.has('username'))
+      seen.push([Number(u.searchParams.get('start_timestamp')), end])
+      if (denied) return new Response(null, { status: 403 })
+      return ok({ quota: end === at(32, 0) / 1000 - 1 ? 128 : todayQuota })
+    }
+    assert.equal(u.host, 'upstream.test')
+    assert.equal(u.pathname, '/api/log/self/stat')
+    assert.equal(options.headers.Authorization, 'Bearer fixture-cost')
+    return missCost ? new Response(null, { status: 503 }) : ok({ quota: 28 })
+  })
+  const source = { origin: 'https://income.test', token: 'fixture-admin', userId: '23', rate: null }
+  const upstream = { id: 'u', name: '上游', origin: 'https://upstream.test', accountId: 1, provider: 'new-api',
+    health: 'ok', unit: 'USD', quotaScale: 0.125, balance: 200, usage: true, checked: now, tried: now, threshold: 0,
+    paused: false, revision: 1, history: [], logs: [], periodDay: '2026-01-31', todayValue: 5, billing: { unit: 'USD', rmbRate: 6 } }
+  m.change(s => { s.sites = [upstream, { ...upstream, id: 'self', origin: source.origin }] })
+  for (const id of ['u', 'self']) m.putSecret(id, Buffer.from('fixture-cost'))
+  denied = true
+  await assert.rejects(saveProfitSource(m, source), /权限/)
+  assert.equal(m.state.profit, undefined)
+  denied = false
+  await saveProfitSource(m, source)
+  const days = () => displayState(m.state).profit.days
+  assert.equal(days()[0].revenue, 98)
+  assert.equal(days()[0].cost, 30)
+  assert.equal(days()[0].profit, 68)
+  assert.deepEqual(seen.at(-1), [at(31, 0) / 1000, now / 1000])
+  assert.ok(!JSON.stringify(m.state).includes('fixture-admin'))
+  m.db.close()
+  m = new Monitor(database, crypto)
+  now = at(32, 9)
+  todayQuota = 0
+  m.change(s => { for (const site of s.sites) Object.assign(site, { tried: now, periodDay: '2026-02-01', todayValue: null }) })
+  missCost = true
+  await m.sweep()
+  assert.deepEqual(seen.at(-1), [at(31, 0) / 1000, at(32, 0) / 1000 - 1])
+  assert.deepEqual(days().map(r => [r.day, r.revenue, r.cost, r.profit, r.estimated]), [
+    ['2026-02-01', 0, 0, 0, false], ['2026-01-31', 112, 30, 82, true],
+  ])
+  assert.deepEqual(days()[0].missing, ['上游'])
+  missCost = false
+  now += 16 * 60000
+  m.change(s => { for (const site of s.sites) Object.assign(site, { tried: now, todayValue: 1 }) })
+  await Promise.all([m.sweep(), m.sweep()])
+  assert.deepEqual(days().map(r => [r.revenue, r.cost, r.profit]), [[0, 6, -6], [112, 21, 91]])
+  denied = true
+  await assert.rejects(saveProfitSource(m, source), /权限/)
+  assert.equal(days()[0].profit, -6)
+  const dest = new Monitor(':memory:', crypto)
+  t.after(() => dest.db.close())
+  const { bytes } = await exportConfig(m, 'fixture-password')
+  assert.ok(!bytes.includes(Buffer.from('fixture-admin')))
+  await importConfig(dest, bytes, 'fixture-password', false)
+  assert.deepEqual(displayState(dest.state).profit, displayState(m.state).profit)
+  assert.equal(await dest.secret('profit-source'), 'fixture-admin')
+})
+
+test('profit backfills whole days and counts a shared wallet estimate once until key readings arrive', async t => {
+  const m = new Monitor(':memory:', { encryptStringAsync: async v => Buffer.from(v), decryptStringAsync: async v => ({ result: v.toString() }) })
+  t.after(() => m.db.close())
+  const now = new Date(2026, 10, 2, 18).getTime(), today = '2026-11-02'
+  t.mock.method(Date, 'now', () => now)
+  t.mock.method(globalThis, 'fetch', async url => Response.json({ success: true,
+    data: new URL(url).pathname === '/api/status' ? { quota_display_type: 'CNY', quota_per_unit: 1, usd_exchange_rate: 1 } : { quota: 30 } }))
+  const wallet = { provider: 'sub2api', name: '共享钱包', origin: 'https://wallet.test',
+    unit: 'USD', walletGroup: '', balanceKind: 'wallet', balance: 3, health: 'ok', paused: false,
+    periodDay: today, todayValue: null, history: [], tried: now,
+    walletSpend: { history: [{ day: today, value: 9, at: now }] } }
+  m.change(s => { s.sites = ['a', 'b'].map(id => ({ ...wallet, id, keyFingerprint: id })) })
+  await saveProfitSource(m, { origin: 'https://income.test', token: 'fixture', start: '2026-10-31' })
+  const rows = () => displayState(m.state).profit.days
+  assert.equal(rows()[0].profit, 21)
+  assert.equal(rows()[0].estimated, true)
+  await m.sweep()
+  assert.deepEqual(rows().map(r => [r.day, r.revenue, r.profit]), [[today, 30, 21], ['2026-11-01', 30, 30], ['2026-10-31', 30, 30]])
+  m.change(s => { s.sites[1].todayValue = 2 })
+  assert.deepEqual([rows()[0].cost, rows()[0].profit, rows()[0].missing], [2, 28, ['共享钱包']])
+  m.change(s => { s.sites[0].todayValue = 0; s.sites[1].todayValue = 2 })
+  assert.equal(rows()[0].cost, 2)
+  assert.equal(rows()[0].estimated, false)
+  await saveProfitSource(m, { origin: 'https://income.test', token: '', start: '2026-10-30' })
+  await m.sweep()
+  assert.deepEqual(rows().map(r => r.day), [today, '2026-11-01', '2026-10-31', '2026-10-30'])
+})
 
 test('balance-only polling carries the last daily reading through a restart, recharge and month boundary', async (t) => {
   const folder = await mkdtemp(join(tmpdir(), 'quotadesk-spend-'))

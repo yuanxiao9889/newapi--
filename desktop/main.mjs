@@ -14,6 +14,7 @@ import {
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Monitor, displayState } from './monitor.mjs'
+import { saveProfitSource } from './profit.mjs'
 import { configureHttp } from './http.mjs'
 import { exportConfig, importConfig, readConfigFile, writeConfigFile } from './config-transfer.mjs'
 
@@ -85,7 +86,7 @@ if (!app.requestSingleInstanceLock()) {
       if (reason === 'quit' || !waiting) pendingExit = reason
       if (waiting) return
       clearInterval(timer)
-      while (activeRequests || monitor?.sending || monitor?.sendingFlashduty || monitor?.flights.size)
+      while (activeRequests || monitor?.sending || monitor?.sendingFlashduty || monitor?.flights.size || monitor?.profitFlight)
         await new Promise((done) => setTimeout(done, 100))
       quitting = true
       app.exit(pendingExit === 'quit' ? 0 : window?.isVisible() ? 75 : 76)
@@ -123,6 +124,7 @@ if (!app.requestSingleInstanceLock()) {
       const configFilters = [{ name: 'QuotaDesk 加密配置', extensions: ['qdconfig'] }]
       const actions = {
         state: () => displayState(monitor.state),
+        saveProfitSource: (x) => saveProfitSource(monitor, x),
         exportConfig: async ({ password }) => {
           const choice = await dialog.showSaveDialog(window, {
             title: '导出配置', filters: configFilters,

@@ -16,6 +16,7 @@ export type Probe = {
 }
 interface Native {
   state(): Promise<Desk>
+  saveProfitSource(p: { origin: string; userId: string; token: string; rate: number | null; start: string }): Promise<void>
   exportConfig(p: { password: string }): Promise<{ count: number } | null>
   importConfig(p: { password: string; applyPreferences: boolean }): Promise<{ added: number; skipped: number } | null>
   openSite(p: { id: string }): Promise<void>

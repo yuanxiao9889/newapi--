@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { createHash, randomUUID } from 'node:crypto'
-import { ApiError, querySite, readUsdQuote, siteAddress } from './new-api.mjs'
+import { ApiError, dayKey, querySite, readUsdQuote, siteAddress } from './new-api.mjs'
 import { querySub2Api } from './sub2api.mjs'
 import { dailySpend } from './daily-spend.mjs'
 import { customConfig, queryCustom } from './custom-balance.mjs'
@@ -8,6 +8,7 @@ import { emptyMail, mailConfig, mailIdentity, deliver, recipients } from './mail
 import { nextRecipient, setRecipients, updateDelivery, needsDeliveryRecovery, recoverDelivery } from './notice-mail.mjs'
 import { integrationAddress, sendFlashduty } from './flashduty.mjs'
 import { siteIdentity } from './config-transfer.mjs'
+import { captureProfit, pollProfit, profitView } from './profit.mjs'
 
 const copy = structuredClone
 const empty = () => ({
@@ -162,7 +163,7 @@ export function displayState(state) {
   const shared = sharedWallets(state.sites)
   const walletSpending = walletSpendFallbacks(state.sites)
   const unread = new Set(state.sites.filter((s) => s.provider === 'sub2api' && !shared.has(walletKey(s))).map(walletKey))
-  return { ...state, unreadWalletCount: unread.size, wallets: walletBalances(state.sites, shared), sites: state.sites.map((site) => {
+  return { ...state, profit: profitView(state.profit), unreadWalletCount: unread.size, wallets: walletBalances(state.sites, shared), sites: state.sites.map((site) => {
     const source = site.provider === 'sub2api' ? shared.get(walletKey(site))?.latest : site
     const factor = site.autoUsd ? rmbFactor(site, site.fallbackRate) : 1
     const points = walletSpending.get(site.id) ?? []
@@ -256,7 +257,9 @@ export class Monitor {
     const next = copy(this.state)
     this.db.exec('BEGIN IMMEDIATE')
     try {
+      if (next.profit && next.profit.lastDay !== dayKey(new Date(Date.now()))) captureProfit(next, Date.now())
       edit(next)
+      captureProfit(next, Date.now())
       this.db
         .prepare('INSERT OR REPLACE INTO workspace(id,data) VALUES(1,?)')
         .run(JSON.stringify(next))
@@ -503,6 +506,10 @@ export class Monitor {
       while (due.length) await this.poll(due.shift(), force)
     }
     await Promise.all(Array.from({ length: Math.min(due.length, 3) }, worker))
+    if (this.state.profit) {
+      if (!this.profitFlight) this.profitFlight = pollProfit(this, force).finally(() => { this.profitFlight = null })
+      await this.profitFlight
+    }
     this.dispatch()
   }
   async setAutoUsd({ id, enabled, fallbackRate }) {

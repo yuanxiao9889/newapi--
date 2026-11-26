@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createCipheriv, scryptSync } from 'node:crypto'
 import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -74,7 +75,7 @@ test('portable encrypted configs merge by account/key, re-encrypt local secrets 
   assert.equal(await dest.secret('mail'), 'fixture-mail-secret')
   assert.ok(!JSON.stringify(displayState(dest.state)).includes('fixture-new-token'))
   await dest.sweep()
-  assert.deepEqual(dest.state.sites.map((s) => s.health), ['pending', 'ok'])
+  assert.deepEqual(dest.state.sites.map((s) => s.health), ['ok', 'ok'])
   assert.equal(displayState(dest.state).sites[1].accountBalance, 210)
   dest.preferences({ theme: 'light', followSystemProxy: true })
   dest.change((s) => { s.sites[0].name = '保留本机备注' })
@@ -108,6 +109,71 @@ test('incorrect passwords, corrupt files and partial database writes leave the d
   assert.equal(dest.db.prepare('SELECT COUNT(*) AS n FROM secrets').get().n, 1)
 })
 
+test('a complete backup restores monitoring history, both notification channels and the original delivery keys', async (t) => {
+  setupFetch(t)
+  const src = machine(t, 'source'), dest = machine(t, 'target')
+  t.mock.method(src, 'dispatch', () => {})
+  const id = await add(src, 'sub2api', '历史记录样例', 'fixture-sub-key')
+  const address = 'https://api.flashcat.cloud/event/push/alert/standard?integration_key=fixture-restore'
+  await src.configureFlashduty({ enabled: true, address })
+  await src.configure({ config: { ...emptyMail, enabled: true, provider: 'resend',
+    from: 'from@example.test', to: 'first@example.test, second@example.test' }, secret: 'mail-key' })
+  src.preferences({ globalThreshold: 500 })
+  src.change(s => {
+    const site = s.sites[0]
+    site.history = [{ day: '2026-09-01', value: 8 }]
+    site.walletSpend.history = [{ day: '2026-09-02', value: 11, at: 1234, since: 1000 }]
+    site.logs.unshift({ at: 2345, text: '历史查询记录' })
+    const open = s.notices[0]
+    open.delivery = 'sending'
+    open.recipients[0].delivery = 'sent'
+    open.recipients[1].delivery = 'sending'
+    s.notices.push({ ...structuredClone(open), id: 'previous-alert', at: 100, closed: 200,
+      delivery: 'sent', recipients: open.recipients.map(r => ({ ...r, delivery: 'sent' })),
+      flashduty: { status: 'sent', confirmedAt: 150, attempts: 1, balance: 24, threshold: 50 } })
+  })
+  const { bytes } = await exportConfig(src, password)
+  for (const value of ['mail-key', 'fixture-restore', '历史查询记录', 'previous-alert'])
+    assert.ok(!bytes.includes(Buffer.from(value)))
+  await importConfig(dest, bytes, password, true)
+  for (const [key, value] of Object.entries(JSON.parse(JSON.stringify(src.state.sites[0]))))
+    assert.deepEqual(dest.state.sites[0][key], value, key)
+  assert.deepEqual(dest.state.mail, src.state.mail)
+  assert.deepEqual(dest.state.flashduty, src.state.flashduty)
+  assert.equal(await dest.secret('mail'), 'mail-key')
+  assert.equal(await dest.secret('flashduty'), address)
+  assert.equal(await dest.secret(id), 'fixture-sub-key')
+  const [open, closed] = dest.state.notices
+  assert.equal(open.id, src.state.notices[0].id)
+  assert.equal(open.siteId, id)
+  assert.equal(open.delivery, 'uncertain')
+  assert.deepEqual(open.recipients.map(r => r.id), src.state.notices[0].recipients.map(r => r.id))
+  assert.deepEqual(open.recipients.map(r => r.delivery), ['sent', 'uncertain'])
+  assert.deepEqual(closed, src.state.notices[1])
+  await importConfig(dest, bytes, password, true)
+  assert.equal(dest.state.notices.length, 2)
+})
+
+test('v1 settings-only files still restore the original snapshot and saved mail', async (t) => {
+  const dest = machine(t, 'target')
+  const header = Buffer.from('QuotaDesk config v1\n'), salt = Buffer.alloc(16, 1), nonce = Buffer.alloc(12, 2)
+  const key = scryptSync(password, salt, 32, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 })
+  const cipher = createCipheriv('aes-256-gcm', key, nonce)
+  cipher.setAAD(header)
+  const prefs = { theme: 'dark', minutes: 30, globalThreshold: null, mail: emptyMail, mailSecret: 'v1-mail' }
+  const site = { name: '旧站点', provider: 'new-api', origin: 'https://fixture.test', userId: '42',
+    accountId: 42, unit: 'CNY', checked: 100, balance: 8, threshold: 5, paused: true }
+  const body = Buffer.concat([cipher.update(JSON.stringify({ ...prefs, entries: [{ site, token: 'v1-token' }] })), cipher.final()])
+  const bytes = Buffer.concat([header, salt, nonce, cipher.getAuthTag(), body])
+  assert.deepEqual(await importConfig(dest, bytes, password, true), { added: 1, skipped: 0 })
+  const restored = dest.state.sites[0]
+  assert.equal(restored.balance, 8)
+  assert.equal(restored.health, 'pending')
+  assert.deepEqual(restored.history, [])
+  assert.equal(await dest.secret(restored.id), 'v1-token')
+  assert.equal(await dest.secret('mail'), 'v1-mail')
+})
+
 test('custom balance monitors keep their query, key and alert behavior across configuration transfer', async (t) => {
   const src = machine(t, 'source'), dest = machine(t, 'target')
   const origin = 'https://fixture.test/v1/balance'
@@ -132,7 +198,7 @@ test('custom balance monitors keep their query, key and alert behavior across co
   const importedId = dest.state.sites[0].id
   amount = '-0.45'
   scope = 'sub_account'
-  await dest.sweep()
+  await dest.refreshSite(importedId)
   const view = displayState(dest.state)
   assert.deepEqual(view.sites[0].custom, custom)
   assert.deepEqual(view.wallets, [{ unit: 'CNY', value: -0.45, rmb: -0.45 }])

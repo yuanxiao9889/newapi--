@@ -68,6 +68,10 @@ export function dayKey(d) {
     String(d.getDate()).padStart(2, '0'),
   ].join('-')
 }
+export function isDayKey(day) {
+  return typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day) && day >= '1970-01-01' &&
+    Number.isFinite(Date.parse(day)) && new Date(day).toISOString().startsWith(day)
+}
 function localMidnight(d, offset = 0) {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate() + offset)
 }
@@ -190,6 +194,27 @@ export async function readUsdQuote(site) {
   const { unit, scale } = display(status, site.origin)
   if (unit !== site.unit) throw new ApiError('站点计价单位已变更，请先刷新余额。')
   return usdQuote(status, unit, scale)
+}
+
+export async function profitScale(origin, rate) {
+  const status = await json(origin + '/api/status', { Accept: 'application/json' }, '收入站点配置')
+  const { unit, scale } = display(status, origin)
+  const quote = usdQuote(status, unit, scale)
+  const rmb = rate ?? (unit === 'CNY' ? 1 : quote.usdPerUnit * quote.usdRate)
+  if (!(rmb > 0) || !Number.isFinite(rmb * scale)) throw Error('收入站未提供有效汇率，请填写每个站点显示单位对应的人民币金额。')
+  return scale * rmb
+}
+
+export async function readDayQuota({ origin, userId }, token, day, at, admin) {
+  const [y, m, d] = day.split('-').map(Number)
+  const start = new Date(y, m - 1, d).getTime() / 1000
+  const end = Math.min(Math.floor(at / 1000), new Date(y, m - 1, d + 1).getTime() / 1000 - 1)
+  const params = new URLSearchParams({ type: '2', start_timestamp: String(start), end_timestamp: String(end) })
+  const headers = { Accept: 'application/json', Authorization: 'Bearer ' + token }
+  if (userId) headers['New-Api-User'] = userId
+  const path = admin ? '/api/log/stat' : '/api/log/self/stat'
+  const data = await json(origin + path + '?' + params, headers, admin ? '全站用量' : '站点成本')
+  return numeric(data?.quota)
 }
 
 export async function querySite({ origin, token, userId }, previous, now = new Date()) {
